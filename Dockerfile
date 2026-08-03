@@ -28,5 +28,4 @@ ENV HF_HUB_OFFLINE=1 \
 EXPOSE 8080
 
 # $PORT is injected by Render/Railway; default 8080 for local `docker run`
-CMD gunicorn app:app --workers 2 --threads 4 --timeout 120 --bind 0.0.0.0:${PORT:-8080}
-    
+CMD gunicorn --bind 0.0.0.0:$PORT app:app --workers 1 --threads 2 --timeout 120    
