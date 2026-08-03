@@ -1,5 +1,5 @@
 FROM python:3.11-slim
-
+# dockerignore 
 # System deps: psycopg2-binary needs libpq at runtime; pymupdf/chromadb need build tools for some wheels
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
@@ -24,7 +24,9 @@ ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     PYTHONUNBUFFERED=1
 
+
 EXPOSE 8080
 
 # $PORT is injected by Render/Railway; default 8080 for local `docker run`
 CMD gunicorn app:app --workers 2 --threads 4 --timeout 120 --bind 0.0.0.0:${PORT:-8080}
+    
