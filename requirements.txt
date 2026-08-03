@@ -1,0 +1,18 @@
+flask
+flask-wtf
+flask-limiter
+psycopg2-binary
+chromadb
+sentence-transformers
+pymupdf
+groq
+pandas
+python-dotenv
+werkzeug
+
+waitress
+gunicorn
+
+
+# .\venv\Scripts\Activate.ps1    activate virtual enviromnt 
+
