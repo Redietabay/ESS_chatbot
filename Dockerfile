@@ -24,8 +24,7 @@ ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     PYTHONUNBUFFERED=1
 
-
 EXPOSE 8080
 
-# $PORT is injected by Render/Railway; default 8080 for local `docker run`
+# Hardcoded port 8080 to fix Railway deployment crash
 CMD gunicorn --bind 0.0.0.0:8080 app:app --workers 1 --threads 2 --timeout 120
