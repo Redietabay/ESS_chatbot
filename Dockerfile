@@ -26,4 +26,4 @@ ENV HF_HUB_OFFLINE=1 \
 
 # Shell form (not exec-array form) so $PORT actually gets expanded.
 # Railway assigns PORT dynamically — do not hardcode a port here.
-CMD gunicorn --bind 0.0.0.0:$PORT app:app --workers 1 --threads 2 --timeout 120
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-8000} app:app --workers 1 --threads 2 --timeout 120"]
