@@ -93,6 +93,81 @@ GROQ_UNAVAILABLE_MSG = "Service temporarily unavailable. Please try again."
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"), max_retries=0)
 
 # ═══════════════════════════════════════
+# OLLAMA FALLBACK (local, no API)
+# Only used when Groq has fully failed for a request (rate-limited on both
+# models, timed out, or erroring) — NOT the primary path. CPU-only laptop
+# here, so keep OLLAMA_MODEL small (e.g. llama3.2:1b) or this will be slow
+# enough to defeat the purpose. Set OLLAMA_ENABLED=false in .env to disable
+# entirely and fall back to the old GROQ_UNAVAILABLE_MSG behavior.
+# ═══════════════════════════════════════
+import requests
+
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
+OLLAMA_ENABLED  = os.getenv("OLLAMA_ENABLED", "true").lower() == "true"
+OLLAMA_TIMEOUT  = float(os.getenv("OLLAMA_TIMEOUT", "60"))
+
+
+def _call_ollama(prompt: str, max_tokens: int = 500) -> str:
+    """Non-streaming local fallback. Returns '' on any failure (model not
+    pulled, Ollama not running, timeout) so callers can detect total failure
+    and fall through to GROQ_UNAVAILABLE_MSG same as before."""
+    if not OLLAMA_ENABLED:
+        return ""
+    try:
+        resp = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"num_predict": max_tokens, "temperature": 0.0},
+            },
+            timeout=OLLAMA_TIMEOUT,
+        )
+        resp.raise_for_status()
+        text = resp.json().get("response", "").strip()
+        if text:
+            log.info(f"Ollama fallback answered ({len(text)} chars) using '{OLLAMA_MODEL}' (Groq exhausted).")
+        return text
+    except Exception as e:
+        log.warning(f"Ollama fallback failed ({OLLAMA_BASE_URL}, model={OLLAMA_MODEL}): {e}")
+        return ""
+
+
+def _call_ollama_stream(prompt: str, max_tokens: int = 500):
+    """Streaming local fallback. Yields text chunks as they arrive; yields
+    nothing at all on failure, so the caller's `yielded_any` check correctly
+    falls through to GROQ_UNAVAILABLE_MSG."""
+    if not OLLAMA_ENABLED:
+        return
+    try:
+        with requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": True,
+                "options": {"num_predict": max_tokens, "temperature": 0.0},
+            },
+            timeout=OLLAMA_TIMEOUT,
+            stream=True,
+        ) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                data = json.loads(line)
+                piece = data.get("response", "")
+                if piece:
+                    yield piece
+                if data.get("done"):
+                    break
+    except Exception as e:
+        log.warning(f"Ollama streaming fallback failed ({OLLAMA_BASE_URL}, model={OLLAMA_MODEL}): {e}")
+        return
+
+# ═══════════════════════════════════════
 # GROQ REQUEST THROTTLE
 # Your logs show Groq itself asking for 33s+ back-off on the fast model —
 # that's a real quota ceiling, not bad luck. Reacting after a 429 (the old
@@ -641,7 +716,7 @@ def call_groq(prompt: str, retries: int = 2, max_tokens: int = 500, model: str =
                 log.warning(f"Model '{use_model}' still cooling down ({cooldown:.1f}s left) — skipping call.")
                 if attempt < retries - 1:
                     continue
-                return GROQ_UNAVAILABLE_MSG
+                return _call_ollama(prompt, max_tokens=max_tokens) or GROQ_UNAVAILABLE_MSG
 
         _throttle_for(use_model).wait_if_needed()
         try:
@@ -697,7 +772,9 @@ def call_groq(prompt: str, retries: int = 2, max_tokens: int = 500, model: str =
                 log.warning(f"Groq call failed (attempt {attempt+1}/{retries}, model={use_model}): {e}")
             if attempt < retries - 1 and wait > 0:
                 time.sleep(wait)
-    return GROQ_UNAVAILABLE_MSG
+    # All Groq retries exhausted (rate-limited on every model, or erroring) —
+    # try the local Ollama fallback before giving up entirely.
+    return _call_ollama(prompt, max_tokens=max_tokens) or GROQ_UNAVAILABLE_MSG
 
 def call_groq_stream(prompt: str, max_tokens: int = 500, model: str = None):
     use_model = model or MODEL
@@ -741,6 +818,12 @@ def call_groq_stream(prompt: str, max_tokens: int = 500, model: str = None):
                 log.warning(f"Model '{use_model}' still cooling down ({cooldown:.1f}s left) — skipping stream attempt.")
                 continue
             else:
+                # Both attempts blocked by cooldown, nothing streamed yet — try local fallback.
+                for piece in _call_ollama_stream(prompt, max_tokens=max_tokens):
+                    yielded_any = True
+                    yield piece
+                if yielded_any:
+                    log.info(f"Streamed answer via Ollama fallback ('{OLLAMA_MODEL}') — Groq models all cooling down.")
                 return
 
         _throttle_for(use_model).wait_if_needed()
@@ -797,11 +880,25 @@ def call_groq_stream(prompt: str, max_tokens: int = 500, model: str = None):
             else:
                 log.warning(f"Groq streaming call failed (attempt {attempt+1}/2, model={use_model}): {e}")
 
-            if yielded_any or attempt == 1:
-                # Either we already streamed partial content (can't safely
-                # restart) or this was the retry itself failing too — give up.
-                # The caller (get_answer_stream) treats an empty/short result
-                # as failure and substitutes GROQ_UNAVAILABLE_MSG.
+            if yielded_any:
+                # Already streamed partial content from Groq — can't safely
+                # restart on a different backend without duplicating/garbling
+                # what the user already saw. Give up here as before.
+                return
+
+            if attempt == 1:
+                # Final Groq attempt failed and nothing was streamed yet —
+                # try the local fallback before giving up entirely. The
+                # caller (get_answer_stream) treats a totally empty result as
+                # failure and substitutes GROQ_UNAVAILABLE_MSG, so an empty
+                # Ollama fallback (not running / model not pulled) degrades
+                # to the exact old behavior.
+                fell_back = False
+                for piece in _call_ollama_stream(prompt, max_tokens=max_tokens):
+                    fell_back = True
+                    yield piece
+                if fell_back:
+                    log.info(f"Streamed answer via Ollama fallback ('{OLLAMA_MODEL}') after Groq exhausted.")
                 return
 
             # Rate limit on the big model, first failure, haven't already
@@ -1838,7 +1935,7 @@ STRICT RULES:
 
 Question: {question}
 Answer:"""
-        max_tok = 220
+        max_tok = 320
         best_source = f"ESS Database & {best_source}"
 
     elif csv_result:
@@ -1879,7 +1976,7 @@ STRICT RULES:
 
 Question: {question}
 Answer:"""
-        max_tok = 220
+        max_tok = 320
 
     else:
         effective_route = "fallback"
@@ -1953,9 +2050,12 @@ English answer:
     full = ""
     # Amharic/Oromo script tokenizes far less efficiently than English — the
     # same content needs roughly 1.5-2x the tokens, so reusing the English
-    # max_tokens here was cutting translations off mid-sentence. Capped so a
-    # single translation can't blow past a sane share of the token budget.
-    translate_max_tokens = min(int(max_tokens * 1.8), 900)
+    # max_tokens here was cutting translations off mid-sentence. Bumped from
+    # 1.8x/900 cap to 2.2x/1100: dense report answers (multiple regions,
+    # percentages, years) sit close to their own English token ceiling
+    # already, so 1.8x wasn't leaving enough room and translations were
+    # truncating mid-word (e.g. "...ተጠ" instead of "...ተጠቀሙ").
+    translate_max_tokens = min(int(max_tokens * 2.2), 1100)
     for piece in call_groq_stream(translate_prompt, max_tokens=translate_max_tokens):
         full += piece
         yield ("chunk", piece)
@@ -1969,4 +2069,4 @@ English answer:
 
 if __name__ == "__main__":
     ensure_cache_table()
-    print("Multilingual RAG Engine initialized.")     
+    print("Multilingual RAG Engine initialized.")
