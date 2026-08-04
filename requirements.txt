@@ -1,5 +1,6 @@
 flask
 flask-wtf
+# requests
 flask-limiter
 psycopg2-binary
 chromadb

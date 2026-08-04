@@ -1,6 +1,9 @@
 import os
+import time
+import threading
 import chromadb
 import logging
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dotenv import load_dotenv
 
 # Must run before the embedding model initializes below — it reads
@@ -43,6 +46,13 @@ TOP_K           = 5
 # in a chunk just outside the old cutoff. Tune via env if you see the
 # opposite problem (irrelevant chunks getting through).
 MIN_SCORE       = float(os.getenv("RETRIEVER_MIN_SCORE", "1.65"))
+# Hard cap on a single query's wall-clock time. Serving under waitress with
+# threads=8 (see app.py), multiple requests can hit `collection` at the same
+# time — ChromaDB's local PersistentClient isn't guaranteed safe for that,
+# and a stuck query previously blocked a worker thread with NO log output at
+# all (no "Found chunks", no "Search error" — just silence). This timeout
+# guarantees the thread always comes back and always logs something.
+SEARCH_TIMEOUT_SECONDS = float(os.getenv("RETRIEVER_SEARCH_TIMEOUT", "10"))
 
 # ═══════════════════════════════════════
 # CHROMADB CONNECTION
@@ -58,6 +68,13 @@ collection = client.get_or_create_collection(
     name=COLLECTION_NAME,
     embedding_function=ef
 )
+
+# Serializes access to `collection` across waitress's worker threads. Reads
+# are usually fine concurrently, but this removes an entire class of
+# lock-contention hangs for the cost of queries queueing briefly instead of
+# running in parallel — worth it given search is already sub-second.
+_collection_lock = threading.Lock()
+_query_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="chroma-query")
 
 # ═══════════════════════════════════════
 # QUERY CLEANING
@@ -77,6 +94,17 @@ def clean_query(question: str) -> str:
 # MAIN SEARCH FUNCTION
 # ═══════════════════════════════════════
 
+def _run_query(question: str, top_k: int):
+    """The actual ChromaDB call, run inside the timeout wrapper below.
+    Serialized via _collection_lock — see comment at the lock's definition."""
+    with _collection_lock:
+        return collection.query(
+            query_texts=[question],
+            n_results=top_k,
+            include=["documents", "metadatas", "distances"]
+        )
+
+
 def search_documents(question: str, top_k: int = TOP_K) -> list:
     """
     Search ChromaDB for most relevant chunks.
@@ -88,12 +116,23 @@ def search_documents(question: str, top_k: int = TOP_K) -> list:
         log.warning("Empty question received")
         return []
 
+    # Logged BEFORE the query runs — previously the only log lines were on
+    # success or exception, so a hung/blocked query left literally no trace
+    # it was ever attempted. This line alone turns "silent failure" into
+    # "visible failure."
+    log.info(f"Searching for: '{question[:50]}'")
+    start = time.time()
+
     try:
-        results = collection.query(
-            query_texts=[question],
-            n_results=top_k,
-            include=["documents", "metadatas", "distances"]
-        )
+        future = _query_executor.submit(_run_query, question, top_k)
+        try:
+            results = future.result(timeout=SEARCH_TIMEOUT_SECONDS)
+        except FuturesTimeoutError:
+            log.error(
+                f"Search TIMED OUT after {SEARCH_TIMEOUT_SECONDS}s for: "
+                f"'{question[:50]}' — returning no results instead of hanging the request."
+            )
+            return []
 
         # Safe structure check
         if (not results
@@ -124,11 +163,11 @@ def search_documents(question: str, top_k: int = TOP_K) -> list:
         # Sort by score — lowest distance = best match
         output.sort(key=lambda x: x["score"])
 
-        log.info(f"Found {len(output)} relevant chunks for: '{question[:50]}'")
+        log.info(f"Found {len(output)} relevant chunks for: '{question[:50]}' ({time.time() - start:.2f}s)")
         return output
 
     except Exception as e:
-        log.error(f"Search error: {str(e)}")
+        log.error(f"Search error after {time.time() - start:.2f}s: {str(e)}")
         return []
 
 
