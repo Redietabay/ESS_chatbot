@@ -1,5 +1,5 @@
 FROM python:3.11-slim
-# dockerignore 
+
 # System deps: psycopg2-binary needs libpq at runtime; pymupdf/chromadb need build tools for some wheels
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
@@ -24,7 +24,6 @@ ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     PYTHONUNBUFFERED=1
 
-EXPOSE 8080
-
-# Hardcoded port 8080 to fix Railway deployment crash
-CMD gunicorn --bind 0.0.0.0:8080 app:app --workers 1 --threads 2 --timeout 120
+# Shell form (not exec-array form) so $PORT actually gets expanded.
+# Railway assigns PORT dynamically — do not hardcode a port here.
+CMD gunicorn --bind 0.0.0.0:$PORT app:app --workers 1 --threads 2 --timeout 120
