@@ -18,6 +18,12 @@ import psycopg2.pool
 import pandas as pd
 from groq import Groq
 from dotenv import load_dotenv
+try:
+    import ftfy  # pip install ftfy — "fixes text for you": repairs mojibake
+except ImportError:
+    ftfy = None
+    print("[rag.py] WARNING: 'ftfy' not installed — mojibake/corrupted-PDF-text "
+          "cleanup is disabled. Run: pip install ftfy")
 
 # CRITICAL: must run before importing retriever — retriever.py initializes
 # the SentenceTransformer model at import time, which reads HF_HUB_OFFLINE /
@@ -56,10 +62,30 @@ if not log.handlers:
 # ═══════════════════════════════════════
 MODEL                    = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 FAST_MODEL               = os.getenv("GROQ_FAST_MODEL", "openai/gpt-oss-20b")
+# Groq retires models with no code-side warning — this already caused a real
+# outage (Aug 20 rag_log.txt: every request 400'd on "llama-3.1-70b-versatile
+# has been decommissioned" until .env was hand-fixed). Mirrors the GEMINI_MODEL
+# guard below: known-dead names get overridden to the current code default
+# instead of failing every request until someone notices in the logs. Extend
+# this set as Groq deprecates more models — check
+# https://console.groq.com/docs/deprecations when a model_decommissioned
+# error shows up in rag_log.txt.
+_GROQ_KNOWN_DECOMMISSIONED = {
+    "llama-3.1-70b-versatile", "llama-3.1-8b-instant", "llama3-70b-8192",
+    "llama3-8b-8192", "mixtral-8x7b-32768", "gemma-7b-it", "gemma2-9b-it",
+}
+if MODEL.strip() in _GROQ_KNOWN_DECOMMISSIONED:
+    log.warning(f"GROQ_MODEL env var is set to the decommissioned '{MODEL.strip()}' — "
+                f"overriding to 'openai/gpt-oss-120b'. Fix/remove GROQ_MODEL in your .env file.")
+    MODEL = "openai/gpt-oss-120b"
+if FAST_MODEL.strip() in _GROQ_KNOWN_DECOMMISSIONED:
+    log.warning(f"GROQ_FAST_MODEL env var is set to the decommissioned '{FAST_MODEL.strip()}' — "
+                f"overriding to 'openai/gpt-oss-20b'. Fix/remove GROQ_FAST_MODEL in your .env file.")
+    FAST_MODEL = "openai/gpt-oss-20b"
 # Wall-clock cap per Groq API call so a stalled connection can't hang a worker
 # indefinitely (e.g. mid-stream network drop). Applies to both the normal and
 # streaming call paths below.
-GROQ_REQUEST_TIMEOUT     = float(os.getenv("GROQ_REQUEST_TIMEOUT", "5.0"))
+GROQ_REQUEST_TIMEOUT     = float(os.getenv("GROQ_REQUEST_TIMEOUT", "30.0"))
 # Cap on how long a single 429 retry wait is allowed to be. Groq's error body
 # tells us how long IT thinks we should wait (e.g. "try again in 10.0s") —
 # honoring that exactly can make one request eat 10+ seconds. Capping it
@@ -71,7 +97,7 @@ PDF_FOLDER               = os.getenv("PDF_FOLDER", "data/pdf")
 MAX_RESULT_ROWS          = int(os.getenv("MAX_RESULT_ROWS", "20"))
 MAX_SCHEMA_COLUMNS_SHOWN = int(os.getenv("MAX_SCHEMA_COLUMNS_SHOWN", "25"))
 CSV_TOP_N_FILES          = int(os.getenv("CSV_TOP_N_FILES", "2"))
-PDF_RETRIEVAL_TOP_K      = int(os.getenv("PDF_RETRIEVAL_TOP_K", "5"))
+PDF_RETRIEVAL_TOP_K      = int(os.getenv("PDF_RETRIEVAL_TOP_K", "8"))
 CACHE_TTL_DAYS           = int(os.getenv("CACHE_TTL_DAYS", "30"))
 DB_POOL_MIN              = int(os.getenv("DB_POOL_MIN", "1"))
 DB_POOL_MAX              = int(os.getenv("DB_POOL_MAX", "5"))
@@ -87,10 +113,45 @@ SOURCE_FORMATS_DESC = os.getenv(
 
 GROQ_UNAVAILABLE_MSG = "Service temporarily unavailable. Please try again."
 
+# Moved to module level (was a local var inside rewrite_and_route()) so
+# _run_pdf_search()'s year-filter below can reuse the exact same keyword
+# list instead of drifting out of sync with a second copy.
+_PRICE_KEYWORDS = ("inflation", "cpi", "consumer price", "price index", "cost of living")
+
 # ═══════════════════════════════════════
 # GROQ CLIENT
 # ═══════════════════════════════════════
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"), max_retries=0)
+
+# ═══════════════════════════════════════
+# FALLBACK CIRCUIT BREAKER
+# Logs show every Groq-exhausted request re-attempting Ollama (not running
+# on this dev machine -> instant connection-refused) and, in the past,
+# Gemini (was 404ing on a retired model name) on every single request,
+# each adding real latency to an already-slow rate-limited answer. Once a
+# fallback tier has failed once, it's overwhelmingly likely to fail again
+# within the next few seconds/minutes (dead process, bad model name, no
+# network) — so skip re-attempting it for a short cooldown instead of
+# re-discovering the same failure on every request. Same pattern as the
+# per-model Groq cooldown above, applied to the fallback tiers themselves.
+# ═══════════════════════════════════════
+_fallback_unreachable_until = {}
+_fallback_lock = threading.Lock()
+FALLBACK_COOLDOWN_SECONDS = float(os.getenv("FALLBACK_COOLDOWN_SECONDS", "60"))
+
+
+def _fallback_available(name: str) -> bool:
+    with _fallback_lock:
+        until = _fallback_unreachable_until.get(name, 0)
+    return time.time() >= until
+
+
+def _mark_fallback_unreachable(name: str, seconds: float = FALLBACK_COOLDOWN_SECONDS):
+    with _fallback_lock:
+        _fallback_unreachable_until[name] = time.time() + seconds
+    log.warning(f"'{name}' fallback failed — skipping it for the next {seconds:.0f}s instead of "
+                f"re-attempting on every subsequent request.")
+
 
 # ═══════════════════════════════════════
 # OLLAMA FALLBACK (local, no API)
@@ -102,6 +163,18 @@ groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"), max_retries=0)
 # ═══════════════════════════════════════
 import requests
 
+# Shared, reused connection pool for every Gemini/Ollama HTTP call below.
+# Previously each call used a bare requests.post(), which opens a brand-new
+# TCP connection + TLS handshake every time — on a slow/jittery connection
+# (confirmed: 90-527ms, high jitter, plain ping to 8.8.8.8) that handshake
+# overhead is paid again on every single fallback call, on top of the
+# actual request. A requests.Session() keeps the underlying connection
+# alive (HTTP keep-alive) and reuses it for subsequent calls to the same
+# host, cutting that repeated setup cost. Groq's own SDK client (see
+# groq_client above) already does this internally — this brings Gemini and
+# Ollama calls up to the same behavior.
+_http_session = requests.Session()
+
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
 OLLAMA_ENABLED  = os.getenv("OLLAMA_ENABLED", "true").lower() == "true"
@@ -112,10 +185,10 @@ def _call_ollama(prompt: str, max_tokens: int = 500) -> str:
     """Non-streaming local fallback. Returns '' on any failure (model not
     pulled, Ollama not running, timeout) so callers can detect total failure
     and fall through to GROQ_UNAVAILABLE_MSG same as before."""
-    if not OLLAMA_ENABLED:
+    if not OLLAMA_ENABLED or not _fallback_available("ollama"):
         return ""
     try:
-        resp = requests.post(
+        resp = _http_session.post(
             f"{OLLAMA_BASE_URL}/api/generate",
             json={
                 "model": OLLAMA_MODEL,
@@ -132,6 +205,7 @@ def _call_ollama(prompt: str, max_tokens: int = 500) -> str:
         return text
     except Exception as e:
         log.warning(f"Ollama fallback failed ({OLLAMA_BASE_URL}, model={OLLAMA_MODEL}): {e}")
+        _mark_fallback_unreachable("ollama")
         return ""
 
 
@@ -139,10 +213,10 @@ def _call_ollama_stream(prompt: str, max_tokens: int = 500):
     """Streaming local fallback. Yields text chunks as they arrive; yields
     nothing at all on failure, so the caller's `yielded_any` check correctly
     falls through to GROQ_UNAVAILABLE_MSG."""
-    if not OLLAMA_ENABLED:
+    if not OLLAMA_ENABLED or not _fallback_available("ollama"):
         return
     try:
-        with requests.post(
+        with _http_session.post(
             f"{OLLAMA_BASE_URL}/api/generate",
             json={
                 "model": OLLAMA_MODEL,
@@ -165,7 +239,511 @@ def _call_ollama_stream(prompt: str, max_tokens: int = 500):
                     break
     except Exception as e:
         log.warning(f"Ollama streaming fallback failed ({OLLAMA_BASE_URL}, model={OLLAMA_MODEL}): {e}")
+        _mark_fallback_unreachable("ollama")
         return
+
+# ═══════════════════════════════════════
+# GEMINI FALLBACK (free tier, tried BEFORE Ollama)
+# Used when Groq has fully failed for a request (rate-limited on both
+# models, timed out, or erroring). Gemini's free tier (Flash-Lite by
+# default) is meaningfully more accurate than a small local Ollama model,
+# so it sits between Groq and Ollama in the fallback chain:
+#   Groq -> Gemini -> Ollama
+# Get a free key (no card required) at https://aistudio.google.com/apikey
+# and set GEMINI_API_KEY in .env. Set GEMINI_ENABLED=false to skip this
+# tier entirely and fall straight through to Ollama (old behavior).
+# NOTE: prompts/responses sent to the Gemini free tier may be used by
+# Google to improve their models — same caveat you already accepted for
+# Groq's free tier, just flagging it since it's a different provider.
+# ═══════════════════════════════════════
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
+# Verified live against this project's actual key on 2026-08-16 (see
+# diagnose_gemini.py): both "gemini-2.5-flash" and "gemini-2.5-flash-lite"
+# 404 with "no longer available to new users" — a Google-side retirement,
+# not a config bug. "gemini-flash-latest" is Google's alias that always
+# points at the current recommended flash model (resolved to
+# gemini-3.7-flash when tested) and survives future retirements without
+# needing another manual model-name fix.
+GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+if GEMINI_MODEL.strip() in ("gemini-2.5-flash-lite", "gemini-2.5-flash"):
+    # Safety net: these dated models 404 on this project's key ("no longer
+    # available to new users"), which means a .env value is overriding the
+    # code default above. Rather than silently 404 on every fallback call
+    # during a demo, force the known-good alias and say so once at startup.
+    log.warning(f"GEMINI_MODEL env var is set to the retired '{GEMINI_MODEL.strip()}' — overriding to 'gemini-flash-latest'. Fix/remove GEMINI_MODEL in your .env file.")
+    GEMINI_MODEL = "gemini-flash-latest"
+GEMINI_ENABLED  = os.getenv("GEMINI_ENABLED", "true").lower() == "true" and bool(GEMINI_API_KEY)
+GEMINI_TIMEOUT  = float(os.getenv("GEMINI_TIMEOUT", "15"))
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+# "latest" aliases can resolve to a reasoning model (confirmed: resolved to
+# gemini-3.7-flash) that spends part of max_tokens on invisible "thinking"
+# before writing the answer — a test call with max_tokens=10 came back with
+# thoughtsTokenCount=7 and an EMPTY answer. Disabling the thinking budget
+# keeps the full token budget going to the actual answer text, which is all
+# this fallback path needs.
+GEMINI_GENERATION_CONFIG_EXTRA = {"thinkingConfig": {"thinkingBudget": 0}}
+
+
+
+def _call_gemini(prompt: str, max_tokens: int = 500) -> str:
+    """Non-streaming Gemini fallback. Returns '' on any failure (no key,
+    rate-limited, network error) so callers fall through to Ollama exactly
+    like a disabled/failed Ollama call already does."""
+    if not GEMINI_ENABLED or not _fallback_available("gemini"):
+        return ""
+    try:
+        resp = _http_session.post(
+            f"{GEMINI_BASE_URL}/{GEMINI_MODEL}:generateContent",
+            params={"key": GEMINI_API_KEY},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.0, **GEMINI_GENERATION_CONFIG_EXTRA},
+            },
+            timeout=GEMINI_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            log.warning(f"Gemini fallback returned no candidates (possibly safety-blocked): {data}")
+            return ""
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text = "".join(p.get("text", "") for p in parts).strip()
+        if text:
+            log.info(f"Gemini fallback answered ({len(text)} chars) using '{GEMINI_MODEL}' (Groq exhausted).")
+        return text
+    except Exception as e:
+        log.warning(f"Gemini fallback failed (model={GEMINI_MODEL}): {e}")
+        _mark_fallback_unreachable("gemini")
+        return ""
+
+
+def _call_gemini_stream(prompt: str, max_tokens: int = 500):
+    """Streaming Gemini fallback via SSE. Yields text chunks as they arrive;
+    yields nothing at all on failure, so the caller's `yielded_any` check
+    correctly falls through to Ollama, same pattern as _call_ollama_stream."""
+    if not GEMINI_ENABLED or not _fallback_available("gemini"):
+        return
+    try:
+        with _http_session.post(
+            f"{GEMINI_BASE_URL}/{GEMINI_MODEL}:streamGenerateContent",
+            params={"key": GEMINI_API_KEY, "alt": "sse"},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.0, **GEMINI_GENERATION_CONFIG_EXTRA},
+            },
+            timeout=GEMINI_TIMEOUT,
+            stream=True,
+        ) as resp:
+            resp.raise_for_status()
+            # requests only trusts a charset it finds in the Content-Type
+            # header. Gemini's SSE responses come back as
+            # "text/event-stream" with no charset param, so requests falls
+            # back to ISO-8859-1 (the HTTP default for text/*) even though
+            # the body is actually UTF-8. iter_lines(decode_unicode=True)
+            # decodes using resp.encoding, so every non-ASCII byte (Amharic
+            # script, Ge'ez numerals, en/em dashes, etc.) comes out as
+            # mojibake, e.g. "2010–2011" -> "2010â€"2011". Pin the encoding
+            # explicitly before iterating so it decodes correctly regardless
+            # of what (if anything) the header says.
+            resp.encoding = "utf-8"
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data: "):
+                    continue
+                payload = line[len("data: "):].strip()
+                if payload in ("", "[DONE]"):
+                    continue
+                try:
+                    data = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    continue
+                parts = candidates[0].get("content", {}).get("parts", [])
+                piece = "".join(p.get("text", "") for p in parts)
+                if piece:
+                    yield piece
+    except Exception as e:
+        log.warning(f"Gemini streaming fallback failed (model={GEMINI_MODEL}): {e}")
+        _mark_fallback_unreachable("gemini")
+        return
+
+# ═══════════════════════════════════════
+# OPENROUTER FALLBACK (free tier, tried AFTER Gemini)
+# One key, many free ":free"-suffixed models on a different domain/infra
+# than Groq and Gemini — a DNS or outage issue that takes down one provider
+# (e.g. generativelanguage.googleapis.com specifically) won't necessarily
+# take this one down at the same moment.
+# Get a free key (no card required) at https://openrouter.ai/keys
+# Set OPENROUTER_ENABLED=false to skip this tier.
+# ═══════════════════════════════════════
+OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+OPENROUTER_ENABLED  = os.getenv("OPENROUTER_ENABLED", "true").lower() == "true" and bool(OPENROUTER_API_KEY)
+OPENROUTER_TIMEOUT  = float(os.getenv("OPENROUTER_TIMEOUT", "15"))
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def _call_openrouter(prompt: str, max_tokens: int = 500) -> str:
+    """Non-streaming OpenRouter fallback. Returns '' on any failure (no key,
+    disabled, rate-limited, network error)."""
+    if not OPENROUTER_ENABLED or not _fallback_available("openrouter"):
+        return ""
+    try:
+        resp = _http_session.post(
+            OPENROUTER_BASE_URL,
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": OPENROUTER_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+            },
+            timeout=OPENROUTER_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        choices = data.get("choices", [])
+        if not choices:
+            log.warning(f"OpenRouter fallback returned no choices: {data}")
+            return ""
+        text = (choices[0].get("message", {}).get("content") or "").strip()
+        if text:
+            log.info(f"OpenRouter fallback answered ({len(text)} chars) using '{OPENROUTER_MODEL}' (Groq/Gemini exhausted).")
+        return text
+    except Exception as e:
+        log.warning(f"OpenRouter fallback failed (model={OPENROUTER_MODEL}): {e}")
+        _mark_fallback_unreachable("openrouter")
+        return ""
+
+
+def _call_openrouter_stream(prompt: str, max_tokens: int = 500):
+    """Streaming OpenRouter fallback (OpenAI-compatible SSE). Yields nothing
+    at all on failure, matching the other streaming fallbacks."""
+    if not OPENROUTER_ENABLED or not _fallback_available("openrouter"):
+        return
+    try:
+        with _http_session.post(
+            OPENROUTER_BASE_URL,
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": OPENROUTER_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "stream": True,
+            },
+            timeout=OPENROUTER_TIMEOUT,
+            stream=True,
+        ) as resp:
+            resp.raise_for_status()
+            # Same fix as the Gemini stream above: pin the decode encoding
+            # instead of trusting requests' ISO-8859-1 fallback, which
+            # mangles Amharic text and punctuation like en-dashes.
+            resp.encoding = "utf-8"
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data: "):
+                    continue
+                payload = line[len("data: "):].strip()
+                if payload in ("", "[DONE]"):
+                    continue
+                try:
+                    data = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                choices = data.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {}).get("content")
+                if delta:
+                    yield delta
+    except Exception as e:
+        log.warning(f"OpenRouter streaming fallback failed (model={OPENROUTER_MODEL}): {e}")
+        _mark_fallback_unreachable("openrouter")
+        return
+
+
+# ═══════════════════════════════════════
+# MISTRAL FALLBACK (free tier, tried AFTER Cerebras)
+# Mistral's "Experiment" tier: no card required, ~1B tokens/month, rate-
+# limited to a couple requests/minute — fine for a fallback tier that only
+# fires when Groq/Gemini/OpenRouter/Cerebras are all already down, since
+# those requests are rare by definition. Get a free key at
+# https://console.mistral.ai (phone verification required, no card).
+# Set MISTRAL_ENABLED=false to skip this tier.
+# ═══════════════════════════════════════
+MISTRAL_API_KEY  = os.getenv("MISTRAL_API_KEY", "")
+MISTRAL_MODEL    = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
+MISTRAL_ENABLED  = os.getenv("MISTRAL_ENABLED", "true").lower() == "true" and bool(MISTRAL_API_KEY)
+MISTRAL_TIMEOUT  = float(os.getenv("MISTRAL_TIMEOUT", "15"))
+MISTRAL_BASE_URL = "https://api.mistral.ai/v1/chat/completions"
+
+
+def _call_mistral(prompt: str, max_tokens: int = 500) -> str:
+    """Non-streaming Mistral fallback. Returns '' on any failure."""
+    if not MISTRAL_ENABLED or not _fallback_available("mistral"):
+        return ""
+    try:
+        resp = _http_session.post(
+            MISTRAL_BASE_URL,
+            headers={"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": MISTRAL_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+            },
+            timeout=MISTRAL_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        choices = data.get("choices", [])
+        if not choices:
+            log.warning(f"Mistral fallback returned no choices: {data}")
+            return ""
+        text = (choices[0].get("message", {}).get("content") or "").strip()
+        if text:
+            log.info(f"Mistral fallback answered ({len(text)} chars) using '{MISTRAL_MODEL}' (prior tiers exhausted).")
+        return text
+    except Exception as e:
+        log.warning(f"Mistral fallback failed (model={MISTRAL_MODEL}): {e}")
+        _mark_fallback_unreachable("mistral")
+        return ""
+
+
+def _call_mistral_stream(prompt: str, max_tokens: int = 500):
+    """Streaming Mistral fallback (OpenAI-compatible SSE)."""
+    if not MISTRAL_ENABLED or not _fallback_available("mistral"):
+        return
+    try:
+        with _http_session.post(
+            MISTRAL_BASE_URL,
+            headers={"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": MISTRAL_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "stream": True,
+            },
+            timeout=MISTRAL_TIMEOUT,
+            stream=True,
+        ) as resp:
+            resp.raise_for_status()
+            resp.encoding = "utf-8"
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data: "):
+                    continue
+                payload = line[len("data: "):].strip()
+                if payload in ("", "[DONE]"):
+                    continue
+                try:
+                    data = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                choices = data.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {}).get("content")
+                if delta:
+                    yield delta
+    except Exception as e:
+        log.warning(f"Mistral streaming fallback failed (model={MISTRAL_MODEL}): {e}")
+        _mark_fallback_unreachable("mistral")
+# Very high daily free token allowance and extremely fast inference — a
+# solid 4th tier for when Groq, Gemini, AND OpenRouter are all down at once.
+# Get a free key (no card required) at https://cloud.cerebras.ai
+# Set CEREBRAS_ENABLED=false to skip this tier.
+# ═══════════════════════════════════════
+CEREBRAS_API_KEY  = os.getenv("CEREBRAS_API_KEY", "")
+CEREBRAS_MODEL    = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
+CEREBRAS_ENABLED  = os.getenv("CEREBRAS_ENABLED", "true").lower() == "true" and bool(CEREBRAS_API_KEY)
+CEREBRAS_TIMEOUT  = float(os.getenv("CEREBRAS_TIMEOUT", "15"))
+CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1/chat/completions"
+
+
+def _call_cerebras(prompt: str, max_tokens: int = 500) -> str:
+    """Non-streaming Cerebras fallback. Returns '' on any failure."""
+    if not CEREBRAS_ENABLED or not _fallback_available("cerebras"):
+        return ""
+    try:
+        resp = _http_session.post(
+            CEREBRAS_BASE_URL,
+            headers={"Authorization": f"Bearer {CEREBRAS_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": CEREBRAS_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+            },
+            timeout=CEREBRAS_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        choices = data.get("choices", [])
+        if not choices:
+            log.warning(f"Cerebras fallback returned no choices: {data}")
+            return ""
+        text = (choices[0].get("message", {}).get("content") or "").strip()
+        if text:
+            log.info(f"Cerebras fallback answered ({len(text)} chars) using '{CEREBRAS_MODEL}' (all prior tiers exhausted).")
+        return text
+    except Exception as e:
+        log.warning(f"Cerebras fallback failed (model={CEREBRAS_MODEL}): {e}")
+        _mark_fallback_unreachable("cerebras")
+        return ""
+
+
+def _call_cerebras_stream(prompt: str, max_tokens: int = 500):
+    """Streaming Cerebras fallback (OpenAI-compatible SSE)."""
+    if not CEREBRAS_ENABLED or not _fallback_available("cerebras"):
+        return
+    try:
+        with _http_session.post(
+            CEREBRAS_BASE_URL,
+            headers={"Authorization": f"Bearer {CEREBRAS_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": CEREBRAS_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "stream": True,
+            },
+            timeout=CEREBRAS_TIMEOUT,
+            stream=True,
+        ) as resp:
+            resp.raise_for_status()
+            # Same fix as the Gemini/OpenRouter streams above.
+            resp.encoding = "utf-8"
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data: "):
+                    continue
+                payload = line[len("data: "):].strip()
+                if payload in ("", "[DONE]"):
+                    continue
+                try:
+                    data = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                choices = data.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {}).get("content")
+                if delta:
+                    yield delta
+    except Exception as e:
+        log.warning(f"Cerebras streaming fallback failed (model={CEREBRAS_MODEL}): {e}")
+        _mark_fallback_unreachable("cerebras")
+        return
+
+
+# ═══════════════════════════════════════
+# COMBINED FALLBACK CHAIN: Groq -> (tiers below, in FALLBACK_ORDER) -> Ollama
+# Each tier is skipped instantly (no network call) while it's in its own
+# 60s cooldown from a recent failure — see _fallback_available(). A tier
+# that's disabled (no key / *_ENABLED=false) is also skipped instantly.
+#
+# Order used to be hardcoded as Gemini -> OpenRouter -> Cerebras. Made
+# configurable via FALLBACK_ORDER in .env (comma-separated, e.g.
+# "cerebras,openrouter,gemini") so you can re-rank tiers based on which
+# ones are actually reliable for you without touching code — e.g. if Groq
+# is hitting its daily limit and Gemini is erroring out for you, put
+# Cerebras/OpenRouter first. Ollama always stays last (it's the local,
+# no-network-required option, so it doubles as the final safety net).
+# Unknown/misspelled names in FALLBACK_ORDER are ignored with a warning;
+# any enabled tier you forget to list is appended at the end.
+# ═══════════════════════════════════════
+_FALLBACK_TIERS = {
+    "gemini":     ("Gemini",     _call_gemini,     _call_gemini_stream),
+    "openrouter": ("OpenRouter", _call_openrouter, _call_openrouter_stream),
+    "cerebras":   ("Cerebras",   _call_cerebras,   _call_cerebras_stream),
+    "mistral":    ("Mistral",    _call_mistral,    _call_mistral_stream),
+}
+# Reordered from the old cerebras-first default: rag_log.txt (Aug 21) shows
+# Cerebras returning 402 Payment Required — the free tier is exhausted, a
+# billing wall, not a transient failure — so it's moved to last (kept, not
+# removed, in case the account gets funded later). Mistral added as a
+# genuinely free 4th option (~1B tokens/month, no card) to replace it in the
+# middle of the chain. Override via FALLBACK_ORDER in .env any time.
+_DEFAULT_FALLBACK_ORDER = ["gemini", "mistral", "openrouter", "cerebras"]
+
+
+def _build_fallback_order() -> list:
+    raw = os.getenv("FALLBACK_ORDER", "")
+    requested = [t.strip().lower() for t in raw.split(",") if t.strip()] or _DEFAULT_FALLBACK_ORDER
+
+    order = []
+    for name in requested:
+        if name not in _FALLBACK_TIERS:
+            log.warning(f"FALLBACK_ORDER: unknown tier '{name}' — ignoring. Valid tiers: {list(_FALLBACK_TIERS)}")
+            continue
+        if name not in order:
+            order.append(name)
+    for name in _FALLBACK_TIERS:  # anything left off the list still runs, just last
+        if name not in order:
+            order.append(name)
+    return order + ["ollama"]  # Ollama is always last
+
+
+_FALLBACK_ORDER = _build_fallback_order()
+log.info(f"Fallback chain order (after Groq): {' -> '.join(_FALLBACK_ORDER)}")
+
+
+def _call_fallback_chain(prompt: str, max_tokens: int = 500) -> str:
+    """Tries each fallback tier in FALLBACK_ORDER, returns the first
+    non-empty answer. Returns '' only if every tier is
+    disabled/unreachable/empty."""
+    for name in _FALLBACK_ORDER:
+        fn = _call_ollama if name == "ollama" else _FALLBACK_TIERS[name][1]
+        text = fn(prompt, max_tokens=max_tokens)
+        if text:
+            return text
+    return ""
+
+
+def _call_fallback_chain_stream(prompt: str, max_tokens: int = 500):
+    """Tries each fallback tier's streaming variant in FALLBACK_ORDER,
+    yielding from the first one that produces a real answer, then stopping.
+
+    Buffers each tier's first MIN_STREAM_FLUSH_CHARS before forwarding
+    anything — a connection that dies mid-stream (confirmed in
+    rag_log.txt: Gemini logged "Streamed answer via Gemini fallback" with
+    no error after yielding only "* **Cow", 5 chars, then nothing —
+    requests' iter_lines() just stops silently on a severed connection
+    instead of raising) used to get treated as a complete, cacheable
+    answer because "yielded at least 1 character" was the only success
+    check. Now: if a tier dies before the buffer fills, that's treated as
+    a failed attempt for THIS tier and we move to the next one instead of
+    showing the user a stub. Once the buffer fills, it flushes and the
+    rest streams live as before — this only changes behavior for streams
+    that die very early.
+    """
+    MIN_STREAM_FLUSH_CHARS = 40
+    for name in _FALLBACK_ORDER:
+        display_name, fn = ("Ollama", _call_ollama_stream) if name == "ollama" else _FALLBACK_TIERS[name][::2]
+        buffer = ""
+        flushed = False
+        for piece in fn(prompt, max_tokens=max_tokens):
+            if flushed:
+                yield piece
+                continue
+            buffer += piece
+            if len(buffer) >= MIN_STREAM_FLUSH_CHARS:
+                flushed = True
+                yield buffer
+        if flushed:
+            log.info(f"Streamed answer via {display_name} fallback.")
+            return
+        if buffer:
+            # Died before reaching the flush threshold — never shown to the
+            # user. Log what we discarded so a real short-answer case (rare
+            # but possible) is still visible in the log for debugging,
+            # instead of vanishing silently.
+            log.warning(
+                f"{display_name} fallback stream died after only {len(buffer)} chars "
+                f"({buffer!r}) — treating as failed, trying next fallback tier."
+            )
 
 # ═══════════════════════════════════════
 # GROQ REQUEST THROTTLE
@@ -550,6 +1128,20 @@ def ensure_cache_table():
                     created_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW()
                 )
             """)
+            # question_text: the table only ever stored the hash, not the
+            # original text. That made a stuck bad cache entry (e.g. the
+            # Dec-EFY-2018 inflation question, cached before the pdf-routing
+            # fix landed and never regenerated since — ON CONFLICT DO
+            # NOTHING below meant it could never self-heal) impossible to
+            # find with a keyword search — you'd have to already know the
+            # exact question text and recompute its hash by hand. Nullable
+            # + backfilled going forward only; existing rows keep NULL here
+            # and are still purgeable via purge_stale_cache.py (matches by
+            # recomputed hash instead).
+            cur.execute("""
+                ALTER TABLE query_cache
+                ADD COLUMN IF NOT EXISTS question_text TEXT
+            """)
         log.info("Cache table ready")
     except Exception as e:
         log.error(f"Cache table error: {str(e)}")
@@ -637,8 +1229,15 @@ def check_cache(question: str, language: str = "en"):
             row = cur.fetchone()
 
             if row and CACHE_TTL_DAYS > 0 and row[3] is not None:
-                tz = row[3].tzinfo if row[3].tzinfo else timezone.utc
-                age = datetime.now(tz) - row[3]
+                # row[3] comes back naive when the DB column/driver doesn't
+                # preserve tz — datetime.now(tz) is always aware, so naive - aware
+                # raised "can't subtract offset-naive and offset-aware datetimes"
+                # (seen repeatedly in rag_log.txt). Normalize both sides to aware
+                # UTC before subtracting instead of deriving tz from the row.
+                created_at = row[3]
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                age = datetime.now(timezone.utc) - created_at
                 if age > timedelta(days=CACHE_TTL_DAYS):
                     cur.execute("DELETE FROM query_cache WHERE question_hash = %s", (q_hash,))
                     return None
@@ -651,6 +1250,71 @@ def check_cache(question: str, language: str = "en"):
         log.error(f"Cache check error: {str(e)}")
         return None
 
+# ═══════════════════════════════════════
+# ETHIOPIAN CALENDAR (EFY) CONTEXT
+# ═══════════════════════════════════════
+# ESS reports are labeled by Ethiopian Fiscal Year (EFY / Ethiopian calendar),
+# not the Gregorian calendar. Ethiopian New Year falls ~Sept 11 Gregorian, and
+# the Ethiopian year is 7-8 years behind. Without this, a question like
+# "inflation rate in 2018" gets compared against report labels like "EFY2018"
+# with no indication that EFY2018 is actually ~Sept 2025-Sept 2026 (i.e. the
+# CURRENT period), not eight years ago — the model just says "not mentioned"
+# with no explanation, which reads as a retrieval failure to the user when
+# it's really a calendar mismatch.
+def _current_efy_context() -> str:
+    """One-line, computed-not-guessed EFY/Gregorian reference for prompts."""
+    now = datetime.now()
+    new_year_cutoff = datetime(now.year, 9, 11)
+    if now >= new_year_cutoff:
+        efy_year = now.year - 7
+        efy_start, efy_end = now.year, now.year + 1
+    else:
+        efy_year = now.year - 8
+        efy_start, efy_end = now.year - 1, now.year
+    return (
+        f"Today (Gregorian {now.strftime('%Y-%m-%d')}) falls in Ethiopian Fiscal Year "
+        f"(EFY) {efy_year}, which runs roughly Sept {efy_start}-Sept {efy_end}. "
+        f"General rule: EFY N ~= Gregorian (N+7) to (N+8), starting ~Sept."
+    )
+
+
+_EFY_RULE = (
+    "When a user asks for a year in Gregorian calendar (e.g., 2018), explicitly check and map "
+    "it to the corresponding Ethiopian Fiscal Year (EFY) before searching the PDF chunks, and "
+    "state both calendars in the response to avoid confusion. "
+    "When the user asks about a year in the Gregorian calendar (e.g. \"2018\"), explicitly "
+    "check and map it to the corresponding Ethiopian Fiscal Year (EFY) BEFORE deciding the "
+    "report doesn't cover it — ESS reports label figures by EFY, not Gregorian year, and the "
+    "two do not share digits. " + _current_efy_context() + " Do NOT say the year isn't "
+    "mentioned just because you don't see that exact number as a Gregorian year in the text. "
+    "Instead: (a) convert using the rule above, (b) give the EFY figure from the text if it's "
+    "there, and (c) always state BOTH calendars in the response (e.g. \"in EFY 2010 "
+    "(~2017/2018)\") so the user isn't confused by the year change. Write EFY years as plain "
+    "Arabic digits (\"EFY 2010\"), never as Ge'ez/Ethiopic numeral characters (፳, ፻, etc.) — "
+    "those are for the reader's own calendar app, not for a mixed English-Amharic answer."
+)
+
+
+def _sanitize_text(text: str) -> str:
+    """Repairs mojibake / corrupted Unicode (e.g. the "EFY 2010\ufffd\ufffd2011"
+    tofu-box garbage seen when a PDF's embedded font has a broken/missing
+    ToUnicode CMap, so PyMuPDF's extraction returns bad codepoints instead
+    of the real character). resp.encoding = "utf-8" on the streaming
+    fallback calls above fixes the classic "windows-1252-over-utf-8"
+    mojibake pattern (â€"); this catches the other class — garbage baked
+    directly into the source PDF's extracted text, which gets quoted
+    verbatim into the model's context and then its answer, so pinning HTTP
+    decoding can't touch it. Applied both to retrieved PDF chunks
+    (retriever.py) and to the final answer text (defense in depth — covers
+    anything a model itself introduces too). No-op (returns text
+    unchanged) if ftfy isn't installed — never crashes the app for a
+    missing optional dependency; log once so it's not a silent gap.
+    """
+    if not text or ftfy is None:
+        return text
+    return ftfy.fix_text(text)
+
+
 def is_bad_answer(answer: str) -> bool:
     if not answer or not answer.strip():
         return True
@@ -659,12 +1323,52 @@ def is_bad_answer(answer: str) -> bool:
         return True
     if a in ("none", "n/a", "error", "null"):
         return True
+    # Catches a stream that died mid-answer past the 40-char buffer in
+    # _call_fallback_chain_stream (e.g. cut off at 150 chars, mid-sentence)
+    # — the buffer only protects the first 40 chars, a later drop still
+    # needs catching here. Heuristic, not exact: very short AND ends
+    # without any sentence-ending punctuation or a closed markdown
+    # bold/table marker is a strong truncation signal for this app's
+    # answer style (every real answer is at least a full sentence).
+    stripped = answer.strip()
+    if len(stripped) < 80 and not stripped.endswith((".", "!", "?", "%", ":", ")")):
+        return True
     # The model's own "I looked, nothing was in the retrieved text" sentinel
     # (see the PDF/hybrid prompts' rule 5). This is a legitimate answer to
     # show the user once, but must never be cached — the next question on
     # the same topic deserves a fresh retrieval attempt, not a permanently
     # stuck "not found" from one weak chunk pull.
-    if "nothing relevant" in a or "no relevant" in a:
+    # NOTE: the prompts never mandate one exact phrase, so the model varies
+    # its wording ("No specific figure...is provided", "isn't in the
+    # retrieved sources", "not mentioned in the report", etc.). A narrow
+    # 2-phrase check let most of these slip through and get cached as if
+    # they were real answers — this is why some questions kept returning
+    # the same stale miss for weeks. Cast a wider net instead.
+    _NOT_FOUND_PATTERNS = (
+        "nothing relevant", "no relevant", "not relevant",
+        "not provided", "isn't provided", "is not provided",
+        "not available", "isn't available", "is not available",
+        "no specific figure", "no specific data", "no specific number",
+        "not mentioned", "isn't mentioned", "is not mentioned",
+        "not found in", "not present in", "isn't present in",
+        "doesn't contain", "does not contain",
+        "isn't in the", "is not in the", "not in the retrieved",
+        "no data", "not specified", "isn't specified",
+        # Widened after finding the Dec-EFY-2018 inflation question stuck
+        # on a cached miss for weeks (rag_log.txt, repeated "Cache hit"
+        # from Aug 14 through Aug 21): the original answer used one of
+        # these equivalent phrasings, none of which the old list caught,
+        # so it slipped past this check, got cached, and — because
+        # save_cache's INSERT used ON CONFLICT DO NOTHING — could never be
+        # overwritten by a later, correct regeneration.
+        "does not include", "doesn't include", "does not detail",
+        "doesn't detail", "does not specify", "doesn't specify",
+        "couldn't find", "could not find", "unable to find",
+        "unable to locate", "no mention of", "no information about",
+        "no information on", "lacks information", "not indicated",
+        "not stated", "wasn't stated", "was not stated",
+    )
+    if any(p in a for p in _NOT_FOUND_PATTERNS):
         return True
     return False
 
@@ -672,15 +1376,31 @@ def save_cache(question: str, answer: str, source: str, page: int, language: str
     if is_bad_answer(answer):
         log.warning(f"Skipped caching bad/sentinel answer for: '{question[:50]}'")
         return
+    answer = _sanitize_text(answer)
     try:
         safe_page = int(page) if (page is not None and str(page).isdigit()) else 0
         q_hash = get_question_hash(question, language)
         with db_cursor(commit=True) as cur:
+            # Was ON CONFLICT DO NOTHING: once a hash had ANY row (even one
+            # that slipped past the old, narrower is_bad_answer() net — see
+            # the widened pattern list above), it was permanently frozen —
+            # a later, correct regeneration for the same question could
+            # never overwrite it. This is what stuck "What was the
+            # inflation rate in Ethiopia in 2018?" on a stale cache entry
+            # from before the pdf-routing fix, for a week+. DO UPDATE lets
+            # a good answer heal a bad one the next time this exact
+            # question is asked and the cache TTL check (or a manual purge)
+            # forces a fresh generation.
             cur.execute("""
-                INSERT INTO query_cache (question_hash, answer, source_doc, source_page)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (question_hash) DO NOTHING
-            """, (q_hash, answer, source, safe_page))
+                INSERT INTO query_cache (question_hash, answer, source_doc, source_page, question_text, created_at)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (question_hash) DO UPDATE
+                    SET answer        = EXCLUDED.answer,
+                        source_doc    = EXCLUDED.source_doc,
+                        source_page   = EXCLUDED.source_page,
+                        question_text = EXCLUDED.question_text,
+                        created_at    = NOW()
+            """, (q_hash, answer, source, safe_page, question[:500]))
     except Exception as e:
         log.error(f"Cache save error: {str(e)}")
 
@@ -695,8 +1415,8 @@ def call_groq(prompt: str, retries: int = 2, max_tokens: int = 500, model: str =
     use_model = model or MODEL
 
     if _token_budget.should_refuse():
-        log.warning(f"Daily token budget exhausted ({_token_budget.ratio():.0%}) — refusing Groq call.")
-        return BUDGET_EXHAUSTED_MSG
+        log.warning(f"Daily token budget exhausted ({_token_budget.ratio():.0%}) — skipping Groq, trying fallback chain.")
+        return _call_fallback_chain(prompt, max_tokens=max_tokens) or BUDGET_EXHAUSTED_MSG
     if _token_budget.should_downgrade() and use_model != FAST_MODEL:
         log.info(f"Token budget at {_token_budget.ratio():.0%} — proactively using {FAST_MODEL} instead of {use_model}.")
         use_model = FAST_MODEL
@@ -716,16 +1436,18 @@ def call_groq(prompt: str, retries: int = 2, max_tokens: int = 500, model: str =
                 log.warning(f"Model '{use_model}' still cooling down ({cooldown:.1f}s left) — skipping call.")
                 if attempt < retries - 1:
                     continue
-                return _call_ollama(prompt, max_tokens=max_tokens) or GROQ_UNAVAILABLE_MSG
+                return _call_fallback_chain(prompt, max_tokens=max_tokens) or GROQ_UNAVAILABLE_MSG
 
         _throttle_for(use_model).wait_if_needed()
         try:
             response = groq_client.chat.completions.create(
-                model       = use_model,
-                messages    = [{"role": "user", "content": prompt}],
-                max_tokens  = max_tokens,
-                temperature = 0.0,
-                timeout     = GROQ_REQUEST_TIMEOUT
+                model             = use_model,
+                messages          = [{"role": "user", "content": prompt}],
+                max_tokens        = max_tokens,
+                temperature       = 0.0,
+                timeout           = GROQ_REQUEST_TIMEOUT,
+                reasoning_effort  = "low",
+                include_reasoning = False,
             )
             usage = getattr(response, "usage", None)
             total = getattr(usage, "total_tokens", None) if usage else None
@@ -773,15 +1495,21 @@ def call_groq(prompt: str, retries: int = 2, max_tokens: int = 500, model: str =
             if attempt < retries - 1 and wait > 0:
                 time.sleep(wait)
     # All Groq retries exhausted (rate-limited on every model, or erroring) —
-    # try the local Ollama fallback before giving up entirely.
-    return _call_ollama(prompt, max_tokens=max_tokens) or GROQ_UNAVAILABLE_MSG
+    # walk the rest of the fallback chain (Gemini -> OpenRouter -> Cerebras
+    # -> Ollama) before giving up entirely.
+    return _call_fallback_chain(prompt, max_tokens=max_tokens) or GROQ_UNAVAILABLE_MSG
 
 def call_groq_stream(prompt: str, max_tokens: int = 500, model: str = None):
     use_model = model or MODEL
 
     if _token_budget.should_refuse():
-        log.warning(f"Daily token budget exhausted ({_token_budget.ratio():.0%}) — refusing Groq stream call.")
-        yield BUDGET_EXHAUSTED_MSG
+        log.warning(f"Daily token budget exhausted ({_token_budget.ratio():.0%}) — skipping Groq stream, trying fallback chain.")
+        yielded_any = False
+        for piece in _call_fallback_chain_stream(prompt, max_tokens=max_tokens):
+            yielded_any = True
+            yield piece
+        if not yielded_any:
+            yield BUDGET_EXHAUSTED_MSG
         return
     if _token_budget.should_downgrade() and use_model != FAST_MODEL:
         log.info(f"Token budget at {_token_budget.ratio():.0%} — proactively streaming {FAST_MODEL} instead of {use_model}.")
@@ -818,12 +1546,12 @@ def call_groq_stream(prompt: str, max_tokens: int = 500, model: str = None):
                 log.warning(f"Model '{use_model}' still cooling down ({cooldown:.1f}s left) — skipping stream attempt.")
                 continue
             else:
-                # Both attempts blocked by cooldown, nothing streamed yet — try local fallback.
-                for piece in _call_ollama_stream(prompt, max_tokens=max_tokens):
+                # Both attempts blocked by cooldown, nothing streamed yet —
+                # walk the fallback chain (Gemini -> OpenRouter -> Cerebras
+                # -> Ollama); _call_fallback_chain_stream logs which one hit.
+                for piece in _call_fallback_chain_stream(prompt, max_tokens=max_tokens):
                     yielded_any = True
                     yield piece
-                if yielded_any:
-                    log.info(f"Streamed answer via Ollama fallback ('{OLLAMA_MODEL}') — Groq models all cooling down.")
                 return
 
         _throttle_for(use_model).wait_if_needed()
@@ -835,6 +1563,8 @@ def call_groq_stream(prompt: str, max_tokens: int = 500, model: str = None):
                 temperature=0.0,
                 stream=True,
                 timeout=GROQ_REQUEST_TIMEOUT,
+                reasoning_effort="low",
+                include_reasoning=False,
             )
             if _stream_options_supported:
                 create_kwargs["stream_options"] = {"include_usage": True}
@@ -891,14 +1621,10 @@ def call_groq_stream(prompt: str, max_tokens: int = 500, model: str = None):
                 # try the local fallback before giving up entirely. The
                 # caller (get_answer_stream) treats a totally empty result as
                 # failure and substitutes GROQ_UNAVAILABLE_MSG, so an empty
-                # Ollama fallback (not running / model not pulled) degrades
-                # to the exact old behavior.
-                fell_back = False
-                for piece in _call_ollama_stream(prompt, max_tokens=max_tokens):
-                    fell_back = True
+                # fallback chain (nothing configured / all down) degrades to
+                # the exact old behavior.
+                for piece in _call_fallback_chain_stream(prompt, max_tokens=max_tokens):
                     yield piece
-                if fell_back:
-                    log.info(f"Streamed answer via Ollama fallback ('{OLLAMA_MODEL}') after Groq exhausted.")
                 return
 
             # Rate limit on the big model, first failure, haven't already
@@ -934,14 +1660,6 @@ _AMHARIC_RE = re.compile(r"[\u1200-\u137F]")
 def _contains_amharic_script(text: str) -> bool:
     return bool(_AMHARIC_RE.search(text or ""))
 
-_OROMO_KEYWORDS = [
-    "maal", "kam", "eessa", "yoom", "maaliif", "akkam", "meeqa", "haala", "gabaasa",
-    "hangam", "eenyu", "maalif", "danda", "argam", "jira", "jiru", "kessa", "keessa",
-    "biyya", "godina", "bara", "lakkoofsa", "baay", "xiqqaa", "guddaa", "dhiyeessi",
-    "oromiyaa", "qonna", "horsiisa", "beela", "gabaa", "sadarkaa", "ummata", "ummanni",
-    "naannoo", "waggaa", "ji'a", "kkf", "fi ", "ni ", "hin ", "irratti"
-]
-
 _ENGLISH_STOPWORDS = {
     "the", "is", "are", "what", "how", "many", "much", "population", "rate",
     "when", "where", "which", "average", "total", "percent", "percentage",
@@ -949,51 +1667,32 @@ _ENGLISH_STOPWORDS = {
 }
 
 def detect_language(question: str) -> str:
-    q_lower = question.lower()
+    """Only 'am' (Amharic) and 'en' (English) are supported answer
+    languages. Amharic script is the only reliable signal — anything else
+    (including questions phrased in Afaan Oromoo) is answered in English
+    rather than attempting an Oromo translation the model can't do well."""
     if _contains_amharic_script(question):
         return "am"
-
-    words = re.findall(r"[a-z']+", q_lower)
-    if not words:
-        return "en"
-
-    oromo_hits = sum(1 for w in words if w in _OROMO_KEYWORDS)
-    english_hits = sum(1 for w in words if w in _ENGLISH_STOPWORDS)
-
-    # Require actual signal either way; if neither language shows evidence,
-    # DON'T silently default to English — let the caller fall back to an
-    # LLM-based classification (see detect_language_llm) instead of guessing.
-    if oromo_hits > 0 and oromo_hits >= english_hits:
-        return "om"
-    if english_hits > 0:
-        return "en"
-
-    return "uncertain"
+    return "en"
 
 
 def detect_language_llm(question: str) -> str:
-    """Fallback classifier for questions the heuristic can't confidently tag
-    (e.g. Afaan Oromoo phrased without any of the whitelisted words, or
-    Amharic typed phonetically in Latin script). Cheap/fast model, tiny output."""
+    """Fallback classifier for the rare ambiguous case (e.g. Amharic typed
+    phonetically in Latin script). Cheap/fast model, tiny output."""
     prompt = f"""Identify the language of this question. It is ESS (Ethiopian Statistical Service)
-chatbot input, so it will be English, Amharic (possibly typed phonetically in Latin letters),
-or Afaan Oromoo. Respond with exactly one lowercase code: en, am, or om. No explanation.
+chatbot input, so it will be English or Amharic (possibly typed phonetically in Latin letters).
+Respond with exactly one lowercase code: en or am. No explanation.
 
 Question: "{question}\""""
-    raw = call_groq(prompt, retries=1, max_tokens=3, model=FAST_MODEL)
+    raw = call_groq(prompt, retries=1, max_tokens=20, model=FAST_MODEL)
     code = re.sub(r"[^a-z]", "", (raw or "").lower().strip())
-    return code if code in ("en", "am", "om") else "en"
+    return code if code in ("en", "am") else "en"
 
 
 def resolve_language(question: str) -> str:
-    """Fast path for the common cases (Fidel script / clear English), LLM
-    fallback only for the ambiguous minority — so this doesn't add latency
-    to most requests."""
-    lang = detect_language(question)
-    if lang == "uncertain":
-        lang = detect_language_llm(question)
-        log.info(f"Language heuristic uncertain, LLM classified as '{lang}': '{question[:50]}'")
-    return lang
+    """detect_language() is now fully deterministic (am or en), so this is
+    just a thin wrapper kept for call-site compatibility."""
+    return detect_language(question)
 
 def get_language_instructions(lang_code: str) -> str:
     if lang_code == "am":
@@ -1002,48 +1701,178 @@ def get_language_instructions(lang_code: str) -> str:
             "- Extract the factual values from the English source materials and write your output in standard Amharic script.\n"
             "- Keep system terms, table titles, or specific document names in English if no direct Amharic translation exists."
         )
-    elif lang_code == "om":
-        return (
-            "\nCRITICAL: Respond in Clear, Grammatical Afaan Oromoo ONLY.\n"
-            "- Translate technical facts and statistics from the English sources into Afaan Oromoo.\n"
-            "- Keep proper nouns or precise document references in English where translation might confuse the source."
-        )
     return "\nCRITICAL: Respond in Clear, Formal English ONLY."
 
 # ═══════════════════════════════════════
 # TERMINOLOGY GLOSSARY (fill this in with ESS staff — native speakers only,
 # never guess these yourself and never trust the LLM's own guess here).
-# Add one entry per row: "English term": {"am": "Amharic", "om": "Afaan Oromoo"}
+# Add one entry per row: "English term": "Amharic translation"
 # Every term listed here gets forced into the translation prompt below, so
 # the model uses YOUR approved wording instead of inventing its own.
 # ═══════════════════════════════════════
 GLOSSARY_TERMS = {
-    # "Household Consumption Expenditure Survey": {"am": "", "om": ""},
-    # "Meher season": {"am": "", "om": ""},
-    # "Belg season": {"am": "", "om": ""},
-    # "Ethiopian Statistical Service": {"am": "", "om": ""},
-    # add real entries here — leave empty dict {} until you have them
+    "Ethiopian Statistical Service": "የኢትዮጵያ ስታቲስቲክስ አገልግሎት",
+    "Meher season": "መኸር",
+    "Belg season": "በልግ",
+    # "Household Consumption Expenditure Survey": "",
+    # get remaining terms confirmed by ESS staff (native speakers) and fill in here
 }
+
+# ═══════════════════════════════════════
+# GOOGLE TRANSLATE (Amharic quality fix)
+# ═══════════════════════════════════════
+# Root cause of weaker Amharic answers: general LLMs (Groq's models
+# included) are trained on far less Amharic than English, so no amount of
+# prompt tuning closes the gap. Google's Translate models are dedicated NMT
+# systems trained on much more Amharic parallel text, so they're used as the
+# FIRST attempt now, with the existing Groq LLM translation kept as fallback.
+#
+# Two backends, pick with GOOGLE_TRANSLATE_MODE:
+#   "free"  -> deep-translator (scrapes translate.google.com). No API key,
+#              no cost, but no SLA — can get rate-limited/blocked under real
+#              traffic. Fine for testing/low-traffic, NOT for a public
+#              government-facing deploy long-term.
+#   "cloud" -> official Google Cloud Translation API. Needs GOOGLE_TRANSLATE_API_KEY
+#              (free tier: 500k chars/month, no charge until you exceed it).
+#              pip install google-cloud-translate
+#   "off"   -> skip Google Translate entirely, go straight to Groq (old behavior).
+GOOGLE_TRANSLATE_MODE = os.getenv("GOOGLE_TRANSLATE_MODE", "free").lower()
+GOOGLE_TRANSLATE_API_KEY = os.getenv("GOOGLE_TRANSLATE_API_KEY", "")
+
+_gt_cloud_client = None
+if GOOGLE_TRANSLATE_MODE == "cloud" and GOOGLE_TRANSLATE_API_KEY:
+    try:
+        from google.cloud import translate_v2 as _gt_v2
+        _gt_cloud_client = _gt_v2.Client(client_options={"api_key": GOOGLE_TRANSLATE_API_KEY})
+    except Exception as e:
+        log.warning(f"Could not init Google Cloud Translate client, falling back to 'free' mode: {e}")
+        GOOGLE_TRANSLATE_MODE = "free"
+
+
+def _google_translate(text: str, target_lang: str) -> str:
+    """target_lang: 'am'. Returns '' on any failure/disabled state so
+    the caller falls through to the existing Groq LLM translation — never
+    blocks the user on a translation-provider error."""
+    if GOOGLE_TRANSLATE_MODE == "off" or not text or not text.strip():
+        return ""
+
+    if GOOGLE_TRANSLATE_MODE == "cloud":
+        if not _gt_cloud_client:
+            return ""
+        try:
+            result = _gt_cloud_client.translate(text, target_language=target_lang, source_language="en")
+            out = (result.get("translatedText") or "").strip()
+            if out:
+                log.info(f"Google Cloud Translate succeeded ({target_lang}, {len(out)} chars).")
+            return out
+        except Exception as e:
+            log.warning(f"Google Cloud Translate failed ({target_lang}): {e}")
+            return ""
+
+    # "free" mode — deep-translator
+    try:
+        from deep_translator import GoogleTranslator
+        out = (GoogleTranslator(source="en", target=target_lang).translate(text) or "").strip()
+        if out:
+            log.info(f"Google Translate (free) succeeded ({target_lang}, {len(out)} chars).")
+        return out
+    except ImportError:
+        log.warning("deep-translator not installed — run 'pip install deep-translator'. Falling back to Groq for translation.")
+        return ""
+    except Exception as e:
+        log.warning(f"Free Google Translate failed ({target_lang}): {e}")
+        return ""
+
+
+# ─── Table-aware translation ───────────────────────────────────────
+# Root cause of "table form" working in English but not Amharic (confirmed
+# in a screenshot: same question, English gives a clean table, Amharic
+# gives a wall of prose with no table at all, and takes 80s+): both
+# translation backends (_google_translate's whole-blob NMT call, and the
+# Groq LLM fallback below) were given the ENTIRE answer — including
+# "| Region | Area (ha) | ... |" rows — as one plain-text string to
+# translate. Machine translation reflows text; it doesn't preserve a
+# pipe-delimited grid, so the table structure was destroyed before it ever
+# reached the frontend's Markdown-table renderer. Fix: split the answer
+# into table / non-table segments BEFORE translating, translate each
+# separately, and for table segments translate cell-by-cell so the exact
+# same "|...|...|" shape survives — numeric/percentage cells pass through
+# completely untouched (translating "3,396,871" or "87.0%" is not just
+# unnecessary, it risks the translator "helpfully" reformatting the number).
+def _split_markdown_table_segments(text: str) -> list:
+    """Splits text into ('prose', str) / ('table', str) segments in
+    original order. A 'table' segment is a contiguous run of lines that
+    each start and end with '|' (covers the header row, the |---|---|
+    separator row, and every data row)."""
+    lines = text.split("\n")
+    segments = []
+    buf = []
+    in_table = False
+
+    def flush(kind):
+        if buf:
+            segments.append((kind, "\n".join(buf)))
+            buf.clear()
+
+    for line in lines:
+        looks_like_row = line.strip().startswith("|") and line.strip().endswith("|") and len(line.strip()) > 1
+        if looks_like_row != in_table:
+            flush("table" if in_table else "prose")
+            in_table = looks_like_row
+        buf.append(line)
+    flush("table" if in_table else "prose")
+    return segments
+
+
+_NUMERIC_CELL_RE = re.compile(r"^[\d.,%\-–—+\s]*$")
+
+
+def _translate_table_segment(table_text: str, target_lang: str, translate_cell) -> str:
+    """translate_cell: a function(str) -> str used for each non-numeric
+    cell's text (region names, header words, etc.). Numeric-only cells
+    (areas, percentages, counts) are passed through byte-for-byte."""
+    out_lines = []
+    for line in table_text.split("\n"):
+        stripped = line.strip()
+        # Separator row ("|---|---|" or "|:--|--:|") — never translate, it
+        # has no human-language content and any edit breaks the table.
+        if re.match(r"^\|?\s*:?-{2,}", stripped.strip("|")):
+            out_lines.append(line)
+            continue
+        if not (stripped.startswith("|") and stripped.endswith("|")):
+            out_lines.append(line)
+            continue
+        cells = stripped[1:-1].split("|")
+        translated_cells = []
+        for cell in cells:
+            c = cell.strip()
+            if not c or _NUMERIC_CELL_RE.match(c):
+                translated_cells.append(f" {c} ")
+            else:
+                t = (translate_cell(c) or c).strip()
+                translated_cells.append(f" {t} ")
+        out_lines.append("|" + "|".join(translated_cells) + "|")
+    return "\n".join(out_lines)
+
 
 def _build_glossary_block(target_lang: str) -> str:
     """Turns GLOSSARY_TERMS into a forced-wording block for the translation
-    prompt. Terms with an empty translation for this language are skipped."""
-    rows = []
-    for en_term, translations in GLOSSARY_TERMS.items():
-        val = (translations or {}).get(target_lang, "").strip()
-        if val:
-            rows.append(f'  "{en_term}" -> "{val}"')
+    prompt. Only used for 'am' — terms without an Amharic translation are
+    skipped."""
+    if target_lang != "am":
+        return ""
+    rows = [f'  "{en_term}" -> "{val}"' for en_term, val in GLOSSARY_TERMS.items() if val]
     if not rows:
         return ""
     return "Mandatory glossary — use this EXACT wording whenever these terms appear, do not translate them any other way:\n" + "\n".join(rows) + "\n\n"
 
 # ═══════════════════════════════════════
-# FINAL-ANSWER TRANSLATION (AM/OM quality fix)
+# FINAL-ANSWER TRANSLATION (Amharic quality fix)
 # ═══════════════════════════════════════
-# Root cause of weaker Amharic/Oromo answers: asking the model to REASON
-# and WRITE directly in a low-resource language in one shot is noticeably
-# less reliable than asking it to reason in English (where it's strongest)
-# and then translate the finished answer. This is a dedicated, narrow
+# Root cause of weaker Amharic answers: asking the model to REASON and
+# WRITE directly in a low-resource language in one shot is noticeably less
+# reliable than asking it to reason in English (where it's strongest) and
+# then translate the finished answer. This is a dedicated, narrow
 # translation call — no reasoning required, so a small/fast model handles
 # it well, and numbers/sources are far less likely to drift.
 _TRANSLATE_FEW_SHOT = {
@@ -1053,23 +1882,63 @@ _TRANSLATE_FEW_SHOT = {
         "according to the Ethiopian Statistical Service.\"\n"
         "Amharic: \"በኢትዮጵያ ስታቲስቲክስ አገልግሎት መሠረት፣ የኢትዮጵያ የ2025 ዓ.ም ግምታዊ የሕዝብ ብዛት 110 ሚሊዮን ገደማ ነው።\"\n\n"
     ),
-    "om": (
-        "Example:\n"
-        "English: \"The projected population of Ethiopia for 2025 is approximately 110 million, "
-        "according to the Ethiopian Statistical Service.\"\n"
-        "Afaan Oromoo: \"Akka Tajaajila Istaatistiksii Itoophiyaatti, baay'inni ummata Itoophiyaa "
-        "bara 2025 tilmaamaan miliyoona 110 ta'a.\"\n\n"
-    ),
 }
 
 def translate_answer(english_answer: str, target_lang: str) -> str:
-    """Translate a finished English answer into Amharic/Afaan Oromoo.
+    """Translate a finished English answer into Amharic.
     Returns the English answer unchanged for 'en' or on translation failure
     (never block the user on a translation error)."""
-    if target_lang not in ("am", "om") or not english_answer or not english_answer.strip():
+    if target_lang != "am" or not english_answer or not english_answer.strip():
         return english_answer
 
-    lang_name = "Amharic (አማርኛ)" if target_lang == "am" else "Afaan Oromoo"
+    segments = _split_markdown_table_segments(english_answer)
+    has_table = any(kind == "table" for kind, _ in segments)
+
+    if has_table:
+        # Translate each segment on its own terms instead of handing the
+        # whole answer (table markup included) to a translator in one
+        # shot — see the comment on _split_markdown_table_segments for why.
+        def _translate_prose(seg: str) -> str:
+            if not seg.strip():
+                return seg
+            t = _google_translate(seg, target_lang)
+            if t:
+                return t
+            # Groq fallback for this prose chunk specifically.
+            prompt = (
+                f"Translate the following English text into Amharic (አማርኛ). "
+                f"Translate ONLY — preserve every number and percentage exactly, "
+                f"output ONLY the translation:\n\n\"{seg}\""
+            )
+            t = call_groq(prompt, retries=1, max_tokens=300, model=MODEL)
+            return seg if is_bad_answer(t) else t.strip()
+
+        def _translate_cell(cell_text: str) -> str:
+            t = _google_translate(cell_text, target_lang)
+            return t if t else cell_text
+
+        out_parts = []
+        for kind, seg in segments:
+            if kind == "table":
+                out_parts.append(_translate_table_segment(seg, target_lang, _translate_cell))
+            else:
+                out_parts.append(_translate_prose(seg))
+        result = "\n".join(out_parts).strip()
+        if result:
+            log.info(f"Table-aware Amharic translation succeeded ({len(segments)} segments, "
+                      f"{sum(1 for k, _ in segments if k == 'table')} table).")
+            return result
+        log.warning("Table-aware Amharic translation produced nothing usable — falling back to English answer.")
+        return english_answer
+
+    # No table in the answer — original whole-text path, unchanged.
+    # 1. Try Google Translate first — dedicated NMT beats a general LLM on
+    #    low-resource languages like Amharic. Falls through to Groq on failure.
+    gt = _google_translate(english_answer, target_lang)
+    if gt:
+        return gt
+
+    lang_name = "Amharic (አማርኛ)"
     few_shot = _TRANSLATE_FEW_SHOT.get(target_lang, "")
     glossary = _build_glossary_block(target_lang)
 
@@ -1116,14 +1985,14 @@ def rewrite_query(question: str, chat_history: list = None) -> str:
     history_block = _format_history(chat_history)
     has_amharic = _contains_amharic_script(question)
     target_lang = resolve_language(question)
-    rewrite_model = MODEL if target_lang in ("am", "om") else FAST_MODEL
+    rewrite_model = MODEL if target_lang == "am" else FAST_MODEL
 
     prompt = f"""You clean up user questions for the Ethiopian Statistical Service (ESS) AI Assistant
 before they are routed to a database or document search. The document/CSV corpus is English-only.
 
 Do ALL of the following that apply:
-1. Fix typos, misspellings, or phonetically written Amharic/Oromo-in-Latin-script text.
-2. CRITICAL: If written in native Amharic script (Fidel) or Afaan Oromoo, TRANSLATE into a clear,
+1. Fix typos, misspellings, or phonetically written Amharic-in-Latin-script text.
+2. CRITICAL: If written in native Amharic script (Fidel), TRANSLATE into a clear,
    concise English query. Do not leave any non-English script in the output.
 3. If a chat history is given and the new question is a vague follow-up, rewrite it into a
    standalone question using the history. Otherwise do not invent new topics.
@@ -1146,7 +2015,7 @@ Question: "{question}"
 
 Output ONLY the corrected/translated question text, in English. No quotes, no explanation."""
 
-    cleaned = call_groq(prompt, retries=2, max_tokens=100, model=rewrite_model)
+    cleaned = call_groq(prompt, retries=2, max_tokens=300, model=rewrite_model)
 
     if is_bad_answer(cleaned):
         return question
@@ -1185,6 +2054,15 @@ def route_question_keywords(question: str) -> str:
         "projected", "projection", "trade", "export", "manufacturing",
         "livestock", "housing", "labour", "labor", "migration",
         "key findings", "summary of", "what does the",
+        # Price/inflation must always route to "pdf": every CSV in this
+        # corpus is household consumption/welfare survey data — none carry
+        # CPI/price-index columns. Routing these to "csv" made the LLM
+        # invent pandas code against unrelated columns and silently return
+        # a fabricated number as "the inflation rate" (seen in rag_log.txt,
+        # Aug 14 15:04-15:05: routed to sect4_hh_w5.csv / s4q00 / pw_w5).
+        "inflation", "cpi", "consumer price", "price index", "cost of living",
+        "land utilization", "land utilisation", "land use", "land-use",
+        "land area", "hectares",
         "ማብራሪያ", "ትርጉም", "ጋባሳ", "ሪፖርት",
     ]
     strong_csv = [
@@ -1212,6 +2090,39 @@ def route_question_keywords(question: str) -> str:
     return "hybrid"
 
 _VALID_ROUTES = {"meta", "csv", "pdf", "hybrid"}
+
+# Shared with _run_pdf_search()'s prefer_source logic below — kept as one
+# list so the routing override and the retrieval boost can never drift
+# apart (previously _LAND_KEYWORDS was local to rewrite_and_route() only).
+_LAND_KEYWORDS_MODULE = (
+    "land utilization", "land utilisation", "land use", "land-use",
+    "land area", "hectares", "arable land", "agricultural land",
+)
+
+# When a question's keywords match a key here, _run_pdf_search() searches
+# this exact indexed filename FIRST (via retriever.search_documents's
+# prefer_source) instead of relying purely on embedding similarity to rank
+# it above a wrong-but-similarly-worded document. Added after confirming
+# (rag_log.txt + screenshots, Aug 22) that "land utilization in other
+# regions" pulled national-area-production.pdf (crop production %) ahead
+# of national-land-use.pdf (land area in hectares — the actually-correct
+# source) — guess_category() in index_pdfs.py buckets the production file
+# under the too-generic "general" category, so a category filter can't
+# separate them; pinning by exact filename can. Extend this dict for other
+# topic/file collisions as they turn up in the logs — don't guess ahead of
+# evidence.
+_PREFERRED_SOURCE_MAP = {
+    _LAND_KEYWORDS_MODULE: "national-land-use.pdf",
+}
+
+
+def _preferred_source_for(question: str) -> str:
+    q = question.lower()
+    for keywords, source in _PREFERRED_SOURCE_MAP.items():
+        if any(k in q for k in keywords):
+            return source
+    return None
+
 
 # ═══════════════════════════════════════
 # REWRITE+ROUTE DECISION CACHE
@@ -1255,7 +2166,7 @@ Question: "{question}"
 
 Respond with exactly one lowercase word: meta, csv, pdf, or hybrid. No punctuation, no explanation."""
 
-    raw = call_groq(prompt, retries=2, max_tokens=5, model=FAST_MODEL)
+    raw = call_groq(prompt, retries=2, max_tokens=20, model=FAST_MODEL)
     cleaned = re.sub(r"[^a-z]", "", raw.lower().strip()) if raw else ""
     route = cleaned
     if route not in _VALID_ROUTES:
@@ -1331,7 +2242,7 @@ def rewrite_and_route(question: str, chat_history: list = None) -> tuple:
     has_amharic = _contains_amharic_script(question)
     # Prefer larger model for AM/OM — translation quality matters more than the ~1s extra
     target_lang = resolve_language(question)
-    rewrite_model = MODEL if target_lang in ("am", "om") else FAST_MODEL
+    rewrite_model = MODEL if target_lang == "am" else FAST_MODEL
 
     prompt = f"""You prepare user questions for the Ethiopian Statistical Service (ESS) AI Assistant in ONE step.
 Do BOTH tasks and return a single JSON object, nothing else.
@@ -1377,7 +2288,7 @@ TASK 2 - Classify the CLEANED English question's intent into exactly one route:
 - "pdf": wants explanation, findings, methodology, survey/report summary, trends, or background (most report-style questions).
 - "hybrid": explicitly needs both a number AND explanation.
 
-Prefer "pdf" when the question mentions: report, survey, findings, statistics, characteristics, analysis, methodology, projected, trade, manufacturing, livestock, housing, labour/labor, inflation report.
+Prefer "pdf" when the question mentions: report, survey, findings, statistics, characteristics, analysis, methodology, projected, trade, manufacturing, livestock, housing, labour/labor, inflation report, land utilization/land use/hectares.
 
 {"Recent conversation:" if history_block else ""}
 {history_block}
@@ -1387,7 +2298,7 @@ Original question: "{question}"
 Respond with ONLY this JSON, no markdown fences, no commentary:
 {{"question": "<cleaned English question>", "route": "<meta|csv|pdf|hybrid>"}}"""
 
-    raw = call_groq(prompt, retries=2, max_tokens=180, model=rewrite_model)
+    raw = call_groq(prompt, retries=2, max_tokens=350, model=rewrite_model)
 
     if is_bad_answer(raw):
         return question, route_question_keywords(question)
@@ -1413,6 +2324,44 @@ Respond with ONLY this JSON, no markdown fences, no commentary:
 
     if route is None:
         route = route_question_keywords(cleaned_question)
+
+    # Hard override, runs regardless of whether the LLM or the keyword
+    # fallback picked the route: no CSV in this corpus has CPI/price data,
+    # so "csv"/"hybrid" for a price/inflation question is always wrong and
+    # produces a fabricated number instead of an honest "not found". This
+    # is what actually mis-routed on Aug 14 (LLM router returned "csv"
+    # directly — the keyword list above never even ran).
+    if route in ("csv", "hybrid") and any(k in cleaned_question.lower() for k in _PRICE_KEYWORDS):
+        log.info(f"Forcing route 'pdf' (was '{route}') for price/inflation question: '{cleaned_question[:50]}'")
+        route = "pdf"
+
+    # Same problem, different topic: "land utilization" reads to the LLM
+    # router as "wants a number" about as often as it reads as "wants a
+    # report summary" — rag_log.txt shows the SAME question ("What is the
+    # land utilization in Amhara region?") routed to "pdf" once and to
+    # "csv"/"hybrid" ~1h40m later (past the 1h rewrite/route cache TTL, so
+    # the LLM router ran fresh and flipped). Both the "csv" AND "hybrid"
+    # branches call query_csv_with_groq(), which generates pandas code
+    # against sect11_com_w5.csv's cs11q04a column — a community-survey
+    # field, not the actual national-land-use.pdf report — which is the
+    # wrong source even when it "succeeds", or returns nothing and still
+    # gets blended into the answer via _gather_sources()'s hybrid path.
+    #
+    # This override originally only checked `route == "csv"`, unlike the
+    # price/inflation override above it which already covers ("csv",
+    # "hybrid"). That asymmetry is why land questions kept failing even
+    # after prefer_source pinning + PDF_RETRIEVAL_TOP_K were added: retriever_log.txt
+    # never shows a single "(preferring national-land-use.pdf)" line for
+    # any Amhara land query, confirming route never actually reached "pdf"
+    # (_preferred_source_for is only consulted inside _run_pdf_search,
+    # which "hybrid" also calls — but blending in a wrong CSV number
+    # alongside the correct PDF chunk is exactly what produced the
+    # "not found" / vague answers). Force these to pure "pdf", mirroring
+    # the price/inflation override exactly.
+    _LAND_KEYWORDS = _LAND_KEYWORDS_MODULE
+    if route in ("csv", "hybrid") and any(k in cleaned_question.lower() for k in _LAND_KEYWORDS):
+        log.info(f"Forcing route 'pdf' (was '{route}') for land-utilization question: '{cleaned_question[:50]}'")
+        route = "pdf"
 
     if cleaned_question.lower() != question.lower():
         log.info(f"Query rewritten: '{question[:60]}' -> '{cleaned_question[:60]}'")
@@ -1681,10 +2630,160 @@ PDF_TITLES = list_pdf_titles(PDF_FOLDER)
 # reader seeing a partially-updated dataset. Not implemented now to avoid
 # adding complexity for a mutation path that doesn't exist yet.
 CSV_DATA = load_csv_files()
+
+# ═══════════════════════════════════════
+# EFY-AWARE YEAR FILTERING (inflation reports)
+# ═══════════════════════════════════════
+# BUG THIS FIXES: index_pdfs.py's guess_year() pulls the first "20xx" digit
+# group out of the filename and stores it as plain metadata "year" — e.g.
+# "1.inflation-report-oct-efy-2018-final.pdf" gets year="2018". But that
+# "2018" IS an Ethiopian Fiscal Year (EFY) label, not a Gregorian year —
+# EFY 2018 runs ~Sept 2025-Sept 2026. Retrieval never filtered on that
+# field at all, so a question about Gregorian 2018 (-> EFY 2010, per
+# _EFY_RULE) could still retrieve and get answered from an EFY2018 chunk
+# just because it's semantically about "inflation", producing a confusing
+# reply that mixes up which calendar the "2018" in the answer refers to
+# (see rag_log.txt, Aug 25 12:40 — "does not provide... for EFY 2010"
+# sourced from "...efy-2018-final.pdf").
+#
+# Only inflation reports are named this way today; extend this set if
+# other EFY-labeled report types (e.g. future CPI bulletins) are added.
+_EFY_LABELED_CATEGORIES = {"inflation"}
+
+
+def _gregorian_to_efy_candidates(g_year: int) -> list:
+    """Mirrors the 'EFY N ~= Gregorian (N+7)-(N+8)' rule already used in
+    _current_efy_context()/_EFY_RULE above. A bare Gregorian year with no
+    month given can fall in either of two EFY years depending on whether
+    the real month is before or after the ~Sept 11 Ethiopian New Year, so
+    return both candidates rather than guessing one."""
+    return [g_year - 8, g_year - 7]
+
+
+def _detect_requested_year(question: str):
+    """Best-effort extraction of a year the user is asking about.
+    Returns (year:int, is_explicit_efy:bool), or (None, False) if no
+    4-digit year appears in the question at all.
+    An explicit EFY mention is trusted as-is; a bare "2018" is assumed
+    Gregorian, since that's what people naturally type.
+
+    Matches "efy 2018", "EFY2018", AND "Ethiopian Fiscal Year 2018" /
+    "fiscal year 2018" — the query-rewrite step upstream (rewrite_and_route)
+    spells "EFY" out as "Ethiopian Fiscal Year" in the cleaned question it
+    hands back, so checking only for the literal "efy" here missed every
+    rewritten question and silently mis-detected real EFY questions as
+    bare Gregorian ones (confirmed via rag_log.txt: "EFY 2018?" ->
+    rewritten to "...Ethiopian Fiscal Year 2018?" -> wrongly treated as
+    Gregorian 2018 -> false "not indexed" answer for data that IS indexed)."""
+    q = question.lower()
+    efy_match = re.search(
+        r"(?:ethiopian\s+fiscal\s+year|ethiopian\s+calendar(?:\s+year)?|ethiopian\s+year|"
+        r"fiscal\s+year|e\.?c\.?|efy)\s*(\d{4})",
+        q
+    )
+    if efy_match:
+        return int(efy_match.group(1)), True
+    # Reversed order: "2013 E.C." / "2018 EC" — how your own report titles
+    # write it (e.g. "2020/21 [2013 E.C.]"), year first then the suffix.
+    efy_suffix_match = re.search(r"(\d{4})\s*e\.?c\.?\b", q)
+    if efy_suffix_match:
+        return int(efy_suffix_match.group(1)), True
+    year_match = re.search(r"\b(19|20)\d{2}\b", q)
+    if year_match:
+        return int(year_match.group(0)), False
+    return None, False
+
+
+def _inflation_efy_years_indexed() -> set:
+    """Distinct EFY years actually indexed for inflation reports, read
+    straight from the PDF filenames on disk (PDF_TITLES, already loaded
+    above) — e.g. '...-efy-2018-final.pdf' -> 2018. Cheap regex scan over
+    ~60 titles, no ChromaDB/DB round trip, and it can't drift out of sync
+    with a reset_ocr_files.py-style partial re-index the way a hardcoded
+    list could."""
+    years = set()
+    for title in PDF_TITLES:
+        t = title.lower()
+        if "inflation" not in t:
+            continue
+        m = re.search(r"efy\s*(\d{4})", t)
+        if m:
+            years.add(int(m.group(1)))
+    return years
+
+
+_INFLATION_EFY_YEARS = _inflation_efy_years_indexed()
+if _INFLATION_EFY_YEARS:
+    log.info(f"Inflation reports indexed for EFY years: {sorted(_INFLATION_EFY_YEARS)}")
+
+# ═══════════════════════════════════════
+# MONTH-AWARE INFLATION FILE MATCHING
+# ═══════════════════════════════════════
+# BUG THIS FIXES: your inflation corpus is ~19 separate MONTHLY reports per
+# EFY year, not one report per year. A question like "inflation rate in EFY
+# 2018" (no month named) or even "inflation rate in October EFY 2018" was
+# left entirely to embedding similarity across ALL indexed PDFs — which can
+# (and did: rag_log.txt, Aug 25 13:40) land on a chunk from the WRONG month
+# of the RIGHT year, e.g. a historical year-over-year comparison table on
+# page 10 of the October report, instead of the actual figure the question
+# asked about. The fix below narrows the search to only the filenames that
+# actually match the requested year (and month, if named) before searching,
+# instead of hoping similarity ranking sorts it out.
+_MONTH_ALIASES = {
+    "january": "jan", "jan": "jan",
+    "february": "feb", "feb": "feb",
+    "march": "mar", "mar": "mar",
+    "april": "apr", "apr": "apr",
+    "may": "may",
+    "june": "jun", "jun": "jun",
+    "july": "jul", "jul": "jul",
+    "august": "aug", "aug": "aug",
+    "september": "sep", "sept": "sep", "sep": "sep",
+    "october": "oct", "oct": "oct",
+    "november": "nov", "nov": "nov",
+    "december": "dec", "dec": "dec",
+}
+
+
+def _detect_requested_month(question: str) -> str:
+    """Returns a 3-letter canonical month token ('jan'..'dec') if the
+    question names a month, else None. Longest aliases checked first so
+    'september' matches before a shorter accidental substring would."""
+    q = question.lower()
+    for alias, token in sorted(_MONTH_ALIASES.items(), key=lambda kv: -len(kv[0])):
+        if re.search(rf"\b{alias}\b", q):
+            return token
+    return None
+
+
+def _inflation_filenames_for(year: int, month_token: str = None) -> list:
+    """Raw filenames (exactly as stored in ChromaDB's 'source' metadata —
+    see index_pdfs.py, which writes pdf_file, the unmodified os.listdir()
+    name) of indexed inflation reports matching the given EFY year,
+    optionally narrowed to one month. Scans PDF_FOLDER directly rather than
+    PDF_TITLES, since PDF_TITLES strips the underscores/hyphens that the
+    real 'source' field still has — a transformed title can't be used as a
+    ChromaDB filter value."""
+    if not os.path.exists(PDF_FOLDER):
+        return []
+    matches = []
+    for f in os.listdir(PDF_FOLDER):
+        if not f.lower().endswith(".pdf"):
+            continue
+        name = f.lower()
+        if "inflation" not in name:
+            continue
+        if str(year) not in name:
+            continue
+        if month_token and month_token not in name:
+            continue
+        matches.append(f)
+    return matches
+
 PER_FILE_SCHEMA = build_per_file_schema(CSV_DATA)
 META_CONTEXT = "CSV DATASETS:\n" + "".join(list(PER_FILE_SCHEMA.values())) + "\nPDF REPORTS:\n" + "\n".join(PDF_TITLES)
 
-def _gather_sources(question: str, route: str):
+def _gather_sources(question: str, route: str, original_question: str = None):
     """Fetch CSV + PDF context. For 'hybrid', both branches run unconditionally
     and don't depend on each other, so run them concurrently instead of back
     to back — the CSV codegen Groq call and the PDF vector search overlap."""
@@ -1694,7 +2793,7 @@ def _gather_sources(question: str, route: str):
     if route == "hybrid" and CSV_DATA:
         with ThreadPoolExecutor(max_workers=2) as ex:
             csv_future = ex.submit(query_csv_with_groq, question, CSV_DATA, PER_FILE_SCHEMA)
-            pdf_future = ex.submit(_run_pdf_search, question)
+            pdf_future = ex.submit(_run_pdf_search, question, original_question)
             csv_result = csv_future.result()
             pdf_context, source, page = pdf_future.result()
             if pdf_context:
@@ -1703,7 +2802,7 @@ def _gather_sources(question: str, route: str):
 
     if route == "hybrid":
         # hybrid but no CSV_DATA loaded at all
-        pdf_context, source, page = _run_pdf_search(question)
+        pdf_context, source, page = _run_pdf_search(question, original_question)
         if pdf_context:
             best_source, best_page = source, page
         return csv_result, pdf_context, best_source, best_page
@@ -1712,7 +2811,7 @@ def _gather_sources(question: str, route: str):
         csv_result = query_csv_with_groq(question, CSV_DATA, PER_FILE_SCHEMA)
 
     if route == "pdf" or (route == "csv" and not csv_result):
-        pdf_context, source, page = _run_pdf_search(question)
+        pdf_context, source, page = _run_pdf_search(question, original_question)
         if pdf_context:
             best_source, best_page = source, page
 
@@ -1722,12 +2821,103 @@ def _gather_sources(question: str, route: str):
     return csv_result, pdf_context, best_source, best_page
 
 
-def _run_pdf_search(question: str):
+def _run_pdf_search(question: str, original_question: str = None):
+    prefer_source = _preferred_source_for(question)
+    inflation_source_in = None
+
+    # Year/EFY detection runs against BOTH the rewritten `question` and the
+    # raw `original_question` (whatever the user actually typed), not just
+    # the rewritten one. rewrite_and_route()'s paraphrase is non-
+    # deterministic — most of the time it keeps "EFY 2018" or expands it to
+    # "Ethiopian Fiscal Year 2018" (both already handled by the regex
+    # below), but it can just as easily drop the EFY marker entirely (e.g.
+    # rewriting "October EFY 2018 inflation..." down to "October 2018
+    # inflation..."). Once that word is gone, no regex downstream can
+    # recover it — _detect_requested_year() then falls back to "bare year
+    # -> assume Gregorian" and confidently reports the WRONG year as
+    # missing, even though the user was explicit. Checking the original
+    # text too means an explicit "EFY" the user typed can never be lost
+    # to an unlucky paraphrase.
+    year_detection_text = f"{original_question} {question}" if original_question else question
+
+    # See _EFY_LABELED_CATEGORIES comment above: for inflation/price
+    # questions that name a year, check up front whether ANY indexed
+    # inflation report could possibly cover it. If not, don't bother
+    # asking ChromaDB — embedding similarity will still return the
+    # closest-topic chunk (a real but wrong-year report) and leave the
+    # model to notice and explain the year mismatch buried in prose,
+    # which is exactly what produced confusing non-answers before. An
+    # explicit, specific notice is clearer for both the model and the user.
+    if any(k in question.lower() for k in _PRICE_KEYWORDS) and _INFLATION_EFY_YEARS:
+        requested_year, is_explicit_efy = _detect_requested_year(year_detection_text)
+        if requested_year is not None:
+            candidate_efys = (
+                [requested_year] if is_explicit_efy
+                else _gregorian_to_efy_candidates(requested_year)
+            )
+            matched_efys = [y for y in candidate_efys if y in _INFLATION_EFY_YEARS]
+            if not matched_efys:
+                available = ", ".join(f"EFY {y}" for y in sorted(_INFLATION_EFY_YEARS))
+                if is_explicit_efy:
+                    year_note = f"EFY {requested_year}"
+                else:
+                    year_note = f"Gregorian {requested_year} (-> EFY {candidate_efys[0]} or EFY {candidate_efys[1]})"
+                log.info(
+                    f"No indexed inflation report covers requested year ({year_note}) — "
+                    f"short-circuiting instead of retrieving a same-topic wrong-year chunk."
+                )
+                notice = (
+                    f"NO MATCHING REPORT INDEXED. The user asked about {year_note}, but no "
+                    f"inflation report for that period is indexed. The inflation reports that "
+                    f"ARE indexed cover: {available} only. State this plainly, including both "
+                    f"the year the user asked about and which years are actually available — "
+                    f"do not guess or substitute a figure from a different year."
+                )
+                return notice, "ESS Inflation Reports Index", 0
+
+            # Year IS indexed — now narrow to the exact monthly report(s)
+            # instead of letting similarity search wander the whole
+            # corpus. See _MONTH_ALIASES/_inflation_filenames_for comment
+            # above for why: same topic + same year but wrong month can
+            # still outrank the actually-requested figure.
+            month_token = _detect_requested_month(year_detection_text)
+            year_for_filenames = matched_efys[0]
+            matches = _inflation_filenames_for(year_for_filenames, month_token)
+            if matches:
+                inflation_source_in = matches
+                log.info(
+                    f"Restricting inflation search to {len(matches)} file(s) for "
+                    f"EFY {year_for_filenames}" + (f" ({month_token})" if month_token else " (all months)")
+                )
     try:
-        results = search_documents(question, top_k=PDF_RETRIEVAL_TOP_K)
+        results = search_documents(
+            question,
+            top_k=PDF_RETRIEVAL_TOP_K if not inflation_source_in else max(PDF_RETRIEVAL_TOP_K, len(inflation_source_in)),
+            prefer_source=prefer_source,
+            source_in=inflation_source_in,
+        )
     except Exception as e:
         log.warning(f"search_documents failed: {e}")
         results = None
+
+    if results is None:
+        # search_documents() returning None means the search did NOT
+        # complete (timeout or exception) — this is "unknown", not
+        # "confirmed nothing here". Previously this was indistinguishable
+        # from a genuinely empty [] result, so the app told the user
+        # "I don't have any data" when the real cause was a 10s retriever
+        # timeout (Aug 25 rag_log.txt/retriever_log.txt: the October
+        # EFY2018 food/non-food follow-up — the data was in the same file
+        # answered correctly six minutes earlier). Be honest instead: this
+        # is a transient failure, not a data gap.
+        log.warning(f"PDF search did not complete (timeout/error) for: '{question[:50]}'")
+        notice = (
+            "SEARCH DID NOT COMPLETE. The document search timed out or hit a temporary "
+            "error — this is NOT a confirmed absence of data, do not claim the report "
+            "lacks this information. Tell the user the search took too long and ask them "
+            "to please try the question again."
+        )
+        return notice, "Search Timeout", 0
 
     if not results:
         return None, None, 0
@@ -1738,11 +2928,71 @@ def _run_pdf_search(question: str):
 # ═══════════════════════════════════════
 # MAIN HYBRID PIPELINE
 # ═══════════════════════════════════════
-def get_answer(question: str, chat_history: list = None) -> dict:
+UPLOAD_MAX_CHARS = 12000  # ~3k tokens — lowered from 24000, was blowing Groq's free-tier TPM on large uploads
+
+def _build_upload_prompt(question: str, uploaded_context: str, uploaded_filename: str) -> str:
+    """Shared prompt for both get_answer() and get_answer_stream() when the
+    user has an uploaded document attached. Deliberately answers from the
+    uploaded text ONLY — not the ESS corpus — since a user who just attached
+    a specific file almost always means "answer from THIS document", not
+    "search everything you have"."""
+    context = uploaded_context[:UPLOAD_MAX_CHARS]
+    return f"""You are the ESS (Ethiopian Statistical Service) AI Assistant.
+The user has attached a document called "{uploaded_filename}". Answer their
+question using ONLY the document text below, IN ENGLISH.
+
+DOCUMENT TEXT:
+{context}
+
+STRICT RULES:
+1. Extract every number, percentage, total, rate, or year that helps answer the question.
+2. Lead with the key figure(s) if the question asks for one.
+   (If a source above is a Markdown table — rows separated by | with a --- header line — match the question to the exact row and column; don't just describe the table.)
+3. If the document does not contain the answer, say so plainly in one short sentence — do not guess or pull in outside knowledge.
+4. Max 180 words. Be factual and direct.
+
+Question: {question}
+Answer:"""
+
+
+def get_answer(question: str, chat_history: list = None,
+                uploaded_context: str = None, uploaded_filename: str = None,
+                force_lang: str = None) -> dict:
     original_question = question
     log.info(f"Processing Question: '{question[:80]}'")
 
-    target_lang = resolve_language(original_question)
+    # force_lang lets the caller (e.g. the widget's EN/አማ toggle) override
+    # auto-detection so the ANSWER always comes back in the language the
+    # user selected in the UI, regardless of what language the question
+    # itself was typed in. Falls back to detection when not given/invalid.
+    target_lang = force_lang if force_lang in ("en", "am") else resolve_language(original_question)
+
+    # An uploaded document takes priority over the ESS corpus and bypasses
+    # the cache entirely — the same question text can mean something
+    # completely different depending on which file is attached, so caching
+    # it under the question alone would return another user's (or another
+    # session's) stale answer.
+    if uploaded_context:
+        final_prompt = _build_upload_prompt(question, uploaded_context, uploaded_filename or "the uploaded document")
+        answer_en = call_groq(final_prompt, max_tokens=500)
+        if is_bad_answer(answer_en):
+            # Distinguish "couldn't reach any LLM provider" from "the doc
+            # doesn't answer this" — the generic GROQ_UNAVAILABLE_MSG reads
+            # like the file was ignored, when the real cause is Groq/Gemini/
+            # Ollama all being unreachable (see call_groq's fallback chain).
+            answer_en = (f'Could not reach the AI service to read "{uploaded_filename or "your document"}" '
+                         f'right now. Check your internet connection (Groq/Gemini need it) or make sure '
+                         f'Ollama is running locally, then try again.')
+        answer = translate_answer(answer_en, target_lang)
+        return {
+            "answer": answer,
+            "source": uploaded_filename or "Uploaded document",
+            "page": 0,
+            "route": "upload",
+            "cached": False,
+            "language": target_lang,
+            "resolved_question": None,
+        }
 
     # Fast path: try the cache with the RAW question first. Most repeat
     # questions are typed the same way twice — this skips a whole rewrite+
@@ -1770,19 +3020,19 @@ Available Data Summary:
 {META_CONTEXT}
 Question: {question}
 Max 100 words."""
-        answer_en = call_groq(prompt, max_tokens=180)
+        answer_en = call_groq(prompt, max_tokens=400)
         answer = translate_answer(answer_en, target_lang)
         result = {"answer": answer, "source": "ESS Asset Index", "page": 0, "route": "meta", "cached": False, "language": target_lang}
         save_cache(question, answer, result["source"], result["page"], target_lang)
         return result
 
     effective_route = route
-    csv_result, pdf_context, best_source, best_page = _gather_sources(question, route)
+    csv_result, pdf_context, best_source, best_page = _gather_sources(question, route, original_question)
 
     # NOTE: all generation prompts below now instruct ENGLISH output only.
     # The target-language version is produced afterward by translate_answer(),
-    # a dedicated translation call — this is more reliable for Amharic/Afaan
-    # Oromoo than asking the model to reason-and-write directly in that
+    # a dedicated translation call — this is more reliable for Amharic than
+    # asking the model to reason-and-write directly in that
     # language in one shot. See translate_answer() above for why.
     if csv_result and pdf_context:
         effective_route = "hybrid"
@@ -1798,13 +3048,18 @@ REPORT TEXT:
 STRICT RULES:
 1. State every relevant number, percentage, total, or year that answers the question.
 2. Prefer concrete figures over vague statements — e.g. "was 12.3% in 2023", not "the report mentions trends".
-3. NEVER say the figure is not provided/mentioned if any relevant number exists in the sources above.
+3. Before answering, check: does a number in the sources above actually match the specific thing
+   asked (same region/category/year)? If yes, state it. If the sources only cover a different
+   region/year/category, say plainly that the exact figure isn't in the retrieved sources rather
+   than reporting the closest number as if it answered the question.
+   (If a source above is a Markdown table — rows separated by | with a --- header line — match the question to the exact row and column; don't just describe the table.)
 4. If both sources give numbers, lead with the database result and add brief context from the report.
-5. Max 150 words. Be direct and factual. Source: {best_source} (Page {best_page})
+5. {_EFY_RULE}
+6. Max 150 words. Be direct and factual. Source: {best_source} (Page {best_page})
 
 Question: {question}
 Answer:"""
-        answer_en = call_groq(final_prompt, max_tokens=220)
+        answer_en = call_groq(final_prompt, max_tokens=500)
         best_source = f"ESS Database & {best_source}"
 
     elif csv_result:
@@ -1822,7 +3077,7 @@ RULES:
 
 Question: {question}
 Answer:"""
-        answer_en = call_groq(final_prompt, max_tokens=200)
+        answer_en = call_groq(final_prompt, max_tokens=400)
         best_source = "ESS Statistical Database"
 
     elif pdf_context:
@@ -1838,14 +3093,32 @@ Source document: {best_source} (Page {best_page})
 STRICT RULES:
 1. Extract every number, percentage, total, rate, or year that helps answer the question.
 2. Lead with the key figure(s), e.g. "According to the report, the inflation rate was X% in YEAR."
-3. NEVER say the figure is "not explicitly mentioned" or "cannot be determined" if any relevant number appears in the text above.
+3. Before answering, check: does a number in the text above actually match the specific thing asked
+   (same region/category/year)? If yes, state it clearly. If the text only covers a different
+   region/year/category, say the exact figure isn't in this report rather than reporting the
+   closest number as if it answered the question.
+   (If a source above is a Markdown table — rows separated by | with a --- header line — match the question to the exact row and column; don't just describe the table.)
 4. If multiple years or regions appear, list the most relevant ones clearly.
 5. Only say nothing relevant was found if that is genuinely true — then say so in one short sentence.
 6. Max 150 words. Be factual and direct.
+7. The text above may contain chunks from MORE THAN ONE source document, each tagged
+   "[Source N: filename - Page X ...]". NEVER combine numbers from two different [Source N] tags
+   into a single answer, even if they look related (e.g. a population figure from [Source 1] and a
+   household count from [Source 2]) — that misattributes facts to the wrong document. Pick the
+   single [Source N] that most directly answers the question and answer from that one only. If you
+   used a source other than the top one ({best_source}), say which document/page you actually used
+   instead of the one listed above.
+8. {_EFY_RULE}
+9. Always finish every sentence. Never stop mid-sentence or mid-list. If you start a number or region, complete the full figure.
+10. EXCEPTION to rule 7: if the sources are monthly inflation reports (filenames containing
+    "inflation") and more than one month appears in the text above, that is expected — these
+    reports are monthly, not annual — so list EACH month's figure with its own month/EFY year
+    (e.g. "EFY 2018: Jan 4.2%, Feb 3.9%, ..."), don't pick just one and don't say the year's rate
+    is unavailable just because no single "annual" number exists.
 
 Question: {question}
 Answer:"""
-        answer_en = call_groq(final_prompt, max_tokens=220)
+        answer_en = call_groq(final_prompt, max_tokens=700)
     else:
         effective_route = "fallback"
         final_prompt = f"""You are the ESS (Ethiopian Statistical Service) AI Assistant.
@@ -1853,7 +3126,7 @@ No matching database result or report text was found for this question.
 Reply in clear English, in one or two short sentences. Do not invent statistics or sources.
 Question: {question}
 Answer:"""
-        answer_en = call_groq(final_prompt, max_tokens=150)
+        answer_en = call_groq(final_prompt, max_tokens=350)
 
     answer = translate_answer(answer_en, target_lang)
 
@@ -1871,11 +3144,35 @@ Answer:"""
 # ═══════════════════════════════════════
 # STREAMING VARIANT
 # ═══════════════════════════════════════
-def get_answer_stream(question: str, chat_history: list = None):
+def get_answer_stream(question: str, chat_history: list = None,
+                       uploaded_context: str = None, uploaded_filename: str = None,
+                       force_lang: str = None):
     original_question = question
     log.info(f"Processing Question (stream): '{question[:80]}'")
 
-    target_lang = resolve_language(original_question)
+    target_lang = force_lang if force_lang in ("en", "am") else resolve_language(original_question)
+
+    if uploaded_context:
+        final_prompt = _build_upload_prompt(question, uploaded_context, uploaded_filename or "the uploaded document")
+        upload_unavailable_msg = (f'Could not reach the AI service to read "{uploaded_filename or "your document"}" '
+                                   f'right now. Check your internet connection (Groq/Gemini need it) or make sure '
+                                   f'Ollama is running locally, then try again.')
+        full_answer = None
+        for kind, out in _stream_or_translate(final_prompt, 260, target_lang, unavailable_msg=upload_unavailable_msg):
+            yield (kind, out)
+            if kind == "done":
+                full_answer = out["answer"]
+        result = {
+            "answer": full_answer,
+            "source": uploaded_filename or "Uploaded document",
+            "page": 0,
+            "route": "upload",
+            "cached": False,
+            "language": target_lang,
+            "resolved_question": None,
+        }
+        yield ("done", result)
+        return
 
     # Fast path: same reasoning as get_answer() above — try the raw question
     # against the cache before paying for a rewrite+route LLM call.
@@ -1913,7 +3210,7 @@ Max 100 words."""
         return
 
     effective_route = route
-    csv_result, pdf_context, best_source, best_page = _gather_sources(question, route)
+    csv_result, pdf_context, best_source, best_page = _gather_sources(question, route, original_question)
 
     if csv_result and pdf_context:
         effective_route = "hybrid"
@@ -1929,13 +3226,18 @@ REPORT TEXT:
 STRICT RULES:
 1. State every relevant number, percentage, total, or year that answers the question.
 2. Prefer concrete figures over vague statements — e.g. "was 12.3% in 2023", not "the report mentions trends".
-3. NEVER say the figure is not provided/mentioned if any relevant number exists in the sources above.
+3. Before answering, check: does a number in the sources above actually match the specific thing
+   asked (same region/category/year)? If yes, state it. If the sources only cover a different
+   region/year/category, say plainly that the exact figure isn't in the retrieved sources rather
+   than reporting the closest number as if it answered the question.
+   (If a source above is a Markdown table — rows separated by | with a --- header line — match the question to the exact row and column; don't just describe the table.)
 4. If both sources give numbers, lead with the database result and add brief context from the report.
-5. Max 150 words. Be direct and factual. Source: {best_source} (Page {best_page})
+5. {_EFY_RULE}
+6. Max 150 words. Be direct and factual. Source: {best_source} (Page {best_page})
 
 Question: {question}
 Answer:"""
-        max_tok = 320
+        max_tok = 500
         best_source = f"ESS Database & {best_source}"
 
     elif csv_result:
@@ -1953,7 +3255,7 @@ RULES:
 
 Question: {question}
 Answer:"""
-        max_tok = 200
+        max_tok = 400
         best_source = "ESS Statistical Database"
 
     elif pdf_context:
@@ -1969,14 +3271,31 @@ Source document: {best_source} (Page {best_page})
 STRICT RULES:
 1. Extract every number, percentage, total, rate, or year that helps answer the question.
 2. Lead with the key figure(s), e.g. "According to the report, the inflation rate was X% in YEAR."
-3. NEVER say the figure is "not explicitly mentioned" or "cannot be determined" if any relevant number appears in the text above.
+3. Before answering, check: does a number in the text above actually match the specific thing asked
+   (same region/category/year)? If yes, state it clearly. If the text only covers a different
+   region/year/category, say the exact figure isn't in this report rather than reporting the
+   closest number as if it answered the question.
+   (If a source above is a Markdown table — rows separated by | with a --- header line — match the question to the exact row and column; don't just describe the table.)
 4. If multiple years or regions appear, list the most relevant ones clearly.
 5. Only say nothing relevant was found if that is genuinely true — then say so in one short sentence.
 6. Max 150 words. Be factual and direct.
+7. The text above may contain chunks from MORE THAN ONE source document, each tagged
+   "[Source N: filename - Page X ...]". NEVER combine numbers from two different [Source N] tags
+   into a single answer, even if they look related (e.g. a population figure from [Source 1] and a
+   household count from [Source 2]) — that misattributes facts to the wrong document. Pick the
+   single [Source N] that most directly answers the question and answer from that one only. If you
+   used a source other than the top one ({best_source}), say which document/page you actually used
+   instead of the one listed above.
+8. {_EFY_RULE}
+9. EXCEPTION to rule 7: if the sources are monthly inflation reports (filenames containing
+   "inflation") and more than one month appears in the text above, that is expected — these
+   reports are monthly, not annual — so list EACH month's figure with its own month/EFY year
+   (e.g. "EFY 2018: Jan 4.2%, Feb 3.9%, ..."), don't pick just one and don't say the year's rate
+   is unavailable just because no single "annual" number exists.
 
 Question: {question}
 Answer:"""
-        max_tok = 320
+        max_tok = 500
 
     else:
         effective_route = "fallback"
@@ -1985,7 +3304,7 @@ No matching database result or report text was found for this question.
 Reply in clear English, in one or two short sentences. Do not invent statistics or sources.
 Question: {question}
 Answer:"""
-        max_tok = 150
+        max_tok = 350
 
     full_answer = None
     for kind, out in _stream_or_translate(final_prompt, max_tok, target_lang):
@@ -2006,32 +3325,45 @@ Answer:"""
     yield ("done", result)
 
 
-def _stream_or_translate(prompt: str, max_tokens: int, target_lang: str):
+def _stream_or_translate(prompt: str, max_tokens: int, target_lang: str, unavailable_msg: str = None):
     """Shared streaming helper for get_answer_stream():
     - English: stream tokens live as they're generated (unchanged behavior).
-    - Amharic/Oromo: generate the English answer first (not streamed, since
+    - Amharic: generate the English answer first (not streamed, since
       it isn't the final text), then STREAM the translation — user still
       sees live token-by-token output, it's just the translation pass.
     Yields ("chunk", text) any number of times, then exactly one
-    ("done", {"answer": full_final_text})."""
-    if target_lang not in ("am", "om"):
+    ("done", {"answer": full_final_text}).
+
+    unavailable_msg: override for the "couldn't generate an answer" text
+    (default GROQ_UNAVAILABLE_MSG) — callers with more context (e.g. an
+    uploaded document) can pass a more specific message."""
+    unavailable_msg = unavailable_msg or GROQ_UNAVAILABLE_MSG
+    if target_lang != "am":
         full = ""
         for piece in call_groq_stream(prompt, max_tokens=max_tokens):
             full += piece
             yield ("chunk", piece)
         if not full.strip():
-            full = GROQ_UNAVAILABLE_MSG
+            full = unavailable_msg
             yield ("chunk", full)
         yield ("done", {"answer": full})
         return
 
     answer_en = call_groq(prompt, max_tokens=max_tokens)
     if is_bad_answer(answer_en):
-        yield ("chunk", GROQ_UNAVAILABLE_MSG)
-        yield ("done", {"answer": GROQ_UNAVAILABLE_MSG})
+        yield ("chunk", unavailable_msg)
+        yield ("done", {"answer": unavailable_msg})
         return
 
-    lang_name = "Amharic (አማርኛ)" if target_lang == "am" else "Afaan Oromoo"
+    # Try Google Translate first (not streaming — sent as one chunk, same
+    # pattern already used above for the non-streamed English-answer step).
+    gt = _google_translate(answer_en, target_lang)
+    if gt:
+        yield ("chunk", gt)
+        yield ("done", {"answer": gt})
+        return
+
+    lang_name = "Amharic (አማርኛ)"
     few_shot = _TRANSLATE_FEW_SHOT.get(target_lang, "")
     glossary = _build_glossary_block(target_lang)
     translate_prompt = f"""Translate the following English answer into {lang_name}.
@@ -2048,7 +3380,7 @@ English answer:
 {lang_name} translation:"""
 
     full = ""
-    # Amharic/Oromo script tokenizes far less efficiently than English — the
+    # Amharic script tokenizes far less efficiently than English — the
     # same content needs roughly 1.5-2x the tokens, so reusing the English
     # max_tokens here was cutting translations off mid-sentence. Bumped from
     # 1.8x/900 cap to 2.2x/1100: dense report answers (multiple regions,

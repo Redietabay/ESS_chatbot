@@ -6,6 +6,13 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dotenv import load_dotenv
 
+try:
+    import ftfy  # pip install ftfy — "fixes text for you": repairs mojibake
+except ImportError:
+    ftfy = None
+    print("[retriever.py] WARNING: 'ftfy' not installed — corrupted-PDF-text "
+          "cleanup is disabled. Run: pip install ftfy")
+
 # Must run before the embedding model initializes below — it reads
 # HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE from the environment. Safe to call
 # again even if rag.py already loaded .env (load_dotenv() is a no-op if
@@ -52,7 +59,7 @@ MIN_SCORE       = float(os.getenv("RETRIEVER_MIN_SCORE", "1.65"))
 # and a stuck query previously blocked a worker thread with NO log output at
 # all (no "Found chunks", no "Search error" — just silence). This timeout
 # guarantees the thread always comes back and always logs something.
-SEARCH_TIMEOUT_SECONDS = float(os.getenv("RETRIEVER_SEARCH_TIMEOUT", "10"))
+SEARCH_TIMEOUT_SECONDS = float(os.getenv("RETRIEVER_SEARCH_TIMEOUT", "20"))
 
 # ═══════════════════════════════════════
 # CHROMADB CONNECTION
@@ -94,21 +101,96 @@ def clean_query(question: str) -> str:
 # MAIN SEARCH FUNCTION
 # ═══════════════════════════════════════
 
-def _run_query(question: str, top_k: int):
+def _run_query(question: str, top_k: int, where: dict = None):
     """The actual ChromaDB call, run inside the timeout wrapper below.
     Serialized via _collection_lock — see comment at the lock's definition."""
     with _collection_lock:
-        return collection.query(
-            query_texts=[question],
-            n_results=top_k,
-            include=["documents", "metadatas", "distances"]
-        )
+        kwargs = {
+            "query_texts": [question],
+            "n_results": top_k,
+            "include": ["documents", "metadatas", "distances"],
+        }
+        if where:
+            kwargs["where"] = where
+        return collection.query(**kwargs)
 
 
-def search_documents(question: str, top_k: int = TOP_K) -> list:
+def _to_output_rows(results) -> list:
+    if (not results
+            or "documents" not in results
+            or not results["documents"]
+            or not results["documents"][0]):
+        return []
+    rows = []
+    for i in range(len(results["documents"][0])):
+        score = results["distances"][0][i]
+        if score > MIN_SCORE:
+            continue
+        text = results["documents"][0][i]
+        # Some indexed PDFs have a broken/missing ToUnicode CMap on an
+        # embedded font — PyMuPDF's text extraction then returns corrupted
+        # codepoints (tofu boxes, e.g. "EFY 2010" then garbage instead of a
+        # dash) baked right into the chunk. Clean it here, once, so it
+        # never reaches the LLM's context (and therefore never gets quoted
+        # into an answer) rather than trying to catch it after the fact.
+        if ftfy is not None:
+            text = ftfy.fix_text(text)
+        rows.append({
+            "text":     text,
+            "source":   results["metadatas"][0][i].get("source",   "Unknown"),
+            "page":     results["metadatas"][0][i].get("page",     0),
+            "category": results["metadatas"][0][i].get("category", "general"),
+            "year":     results["metadatas"][0][i].get("year",     "unknown"),
+            "score":    round(score, 4)
+        })
+    return rows
+
+
+def search_documents(question: str, top_k: int = TOP_K, prefer_source: str = None, source_in: list = None):
     """
     Search ChromaDB for most relevant chunks.
-    Returns list of results with text, source, page, score.
+
+    Returns one of three things — callers MUST distinguish them, they mean
+    different things:
+      - a non-empty list of result dicts: chunks found, use them.
+      - an empty list []: search completed normally and genuinely found
+        nothing relevant (below MIN_SCORE, or no chunks at all).
+      - None: search did NOT complete (timeout or exception) — this is
+        "unknown", not "confirmed empty". Treating None the same as []
+        previously caused the app to confidently tell a user "I don't have
+        any data" when the true cause was an infra timeout, not an absence
+        of data (Aug 25 rag_log.txt: October EFY2018 food/non-food
+        follow-up — retriever_log.txt shows a 10s timeout, not a real
+        empty result; the answer was sitting in the same file six minutes
+        earlier). Callers should surface a "please try again" style message
+        for None, not a "no data available" claim.
+
+    prefer_source: an exact filename (matches the "source" metadata field
+    set at index time, e.g. "national-land-use.pdf"). When given, this file
+    is searched FIRST with a metadata filter, and its chunks are placed
+    ahead of the general (unfiltered) results — instead of leaving it to
+    embedding similarity alone to rank the right document above a
+    similarly-worded but wrong one.
+
+    Added after confirming (rag_log.txt, screenshots) that "land
+    utilization in other regions" pulled national-area-production.pdf
+    (crop production %, wrong) ahead of national-land-use.pdf (land area
+    hectares, right) — guess_category() in index_pdfs.py buckets both
+    under a category too generic to filter on ("general" for the
+    production file, since its filename matches none of that function's
+    keyword lists), so a plain category filter can't fix this; pinning by
+    exact filename can.
+
+    source_in: optional list of exact filenames to restrict the search to
+    (ChromaDB "$in" filter on the "source" metadata field), ignored if
+    prefer_source is also given. Added for the ESS inflation corpus, which
+    is ~19 separate MONTHLY reports, not one report per year — a bare
+    "inflation rate in EFY 2018" question has no single right file to
+    prefer, but letting embedding similarity search all ~60+ indexed PDFs
+    means a same-topic chunk from the wrong month (e.g. a historical
+    comparison table on page 10 of the October report) can beat the actual
+    right-month figure sitting in a different file entirely. Passing every
+    EFY-2018 inflation filename here keeps the search inside just that set.
     """
     question = clean_query(question)
 
@@ -116,49 +198,65 @@ def search_documents(question: str, top_k: int = TOP_K) -> list:
         log.warning("Empty question received")
         return []
 
-    # Logged BEFORE the query runs — previously the only log lines were on
-    # success or exception, so a hung/blocked query left literally no trace
-    # it was ever attempted. This line alone turns "silent failure" into
-    # "visible failure."
-    log.info(f"Searching for: '{question[:50]}'")
+    log.info(
+        f"Searching for: '{question[:50]}'"
+        + (f" (preferring {prefer_source})" if prefer_source else "")
+        + (f" (restricted to {len(source_in)} file(s))" if source_in and not prefer_source else "")
+    )
     start = time.time()
 
     try:
-        future = _query_executor.submit(_run_query, question, top_k)
+        if prefer_source:
+            preferred_future = _query_executor.submit(_run_query, question, top_k, {"source": prefer_source})
+            general_future = _query_executor.submit(_run_query, question, top_k)
+            try:
+                preferred_results = preferred_future.result(timeout=SEARCH_TIMEOUT_SECONDS)
+                general_results = general_future.result(timeout=SEARCH_TIMEOUT_SECONDS)
+            except FuturesTimeoutError:
+                log.error(f"Search TIMED OUT after {SEARCH_TIMEOUT_SECONDS}s for: '{question[:50]}'")
+                # None, not [] — a timeout means "we don't know", not "we
+                # checked and there's nothing". Confusing the two is what
+                # made the app confidently tell a user "I don't have any
+                # data" when the real cause was an infra hiccup (Aug 25
+                # rag_log.txt: the October EFY2018 food/non-food follow-up).
+                return None
+
+            preferred_rows = _to_output_rows(preferred_results)
+            general_rows = _to_output_rows(general_results)
+
+            seen = {(r["source"], r["page"], r["text"][:80]) for r in preferred_rows}
+            merged = preferred_rows + [
+                r for r in general_rows
+                if (r["source"], r["page"], r["text"][:80]) not in seen
+            ]
+            # Preferred-source chunks keep their place at the front
+            # regardless of score — that's the whole point of "prefer" —
+            # then the rest sort by score as usual.
+            merged = preferred_rows + sorted(merged[len(preferred_rows):], key=lambda x: x["score"])
+            output = merged[:top_k]
+
+            if not output:
+                log.warning("No results found in ChromaDB")
+                return []
+            log.info(f"Found {len(output)} relevant chunks ({len(preferred_rows)} from {prefer_source}) for: '{question[:50]}' ({time.time() - start:.2f}s)")
+            return output
+
+        where = {"source": {"$in": source_in}} if source_in else None
+        future = _query_executor.submit(_run_query, question, top_k, where)
         try:
             results = future.result(timeout=SEARCH_TIMEOUT_SECONDS)
         except FuturesTimeoutError:
             log.error(
                 f"Search TIMED OUT after {SEARCH_TIMEOUT_SECONDS}s for: "
-                f"'{question[:50]}' — returning no results instead of hanging the request."
+                f"'{question[:50]}' — returning None (unknown, not confirmed-empty) "
+                f"instead of hanging the request."
             )
-            return []
+            return None
 
-        # Safe structure check
-        if (not results
-                or "documents" not in results
-                or not results["documents"]
-                or not results["documents"][0]):
+        output = _to_output_rows(results)
+        if not output:
             log.warning("No results found in ChromaDB")
             return []
-
-        output = []
-        for i in range(len(results["documents"][0])):
-
-            score = results["distances"][0][i]
-
-            # Filter weak results
-            if score > MIN_SCORE:
-                continue
-
-            output.append({
-                "text":     results["documents"][0][i],
-                "source":   results["metadatas"][0][i].get("source",   "Unknown"),
-                "page":     results["metadatas"][0][i].get("page",     0),
-                "category": results["metadatas"][0][i].get("category", "general"),
-                "year":     results["metadatas"][0][i].get("year",     "unknown"),
-                "score":    round(score, 4)
-            })
 
         # Sort by score — lowest distance = best match
         output.sort(key=lambda x: x["score"])
@@ -168,7 +266,9 @@ def search_documents(question: str, top_k: int = TOP_K) -> list:
 
     except Exception as e:
         log.error(f"Search error after {time.time() - start:.2f}s: {str(e)}")
-        return []
+        # Also None, not [] — an exception mid-search is exactly the same
+        # "unknown" case as a timeout, not a confirmed-empty result.
+        return None
 
 
 # ═══════════════════════════════════════
@@ -231,3 +331,4 @@ if __name__ == "__main__":
         print(f"Year      : {results[0]['year']}")
         print(f"Preview   : {results[0]['text'][:200]}...")
         print("-" * 50)
+        

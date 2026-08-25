@@ -56,7 +56,7 @@ try:
     from groq import Groq
     client = Groq(api_key=key, max_retries=0)
     resp = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
+        model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
         messages=[{"role": "user", "content": "Say OK"}],
         max_tokens=5,
         timeout=10,

@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESS Chatbot Widget Local Test</title>
+    <style>
+        :root {
+            --primary-color: #0f766e;
+            --primary-hover: #115e59;
+            --bg-gradient: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+            --card-bg: #ffffff;
+            --text-main: #1e293b;
+            --text-muted: #64748b;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: var(--bg-gradient);
+            color: var(--text-main);
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+
+        .test-container {
+            background: var(--card-bg);
+            padding: 40px 50px;
+            border-radius: 16px;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.05), 0 8px 10px -6px rgba(0, 0, 0, 0.05);
+            text-align: center;
+            max-width: 500px;
+            width: 90%;
+            border: 1px solid rgba(226, 232, 240, 0.8);
+        }
+
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background-color: #f0fdf4;
+            color: #166534;
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 20px;
+            border: 1px solid #bbf7d0;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            background-color: #22c55e;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(34, 197, 94, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+        }
+
+        h1 {
+            color: var(--text-main);
+            font-size: 24px;
+            margin-bottom: 12px;
+            font-weight: 700;
+        }
+
+        p {
+            color: var(--text-muted);
+            font-size: 15px;
+            line-height: 1.6;
+            margin-bottom: 30px;
+        }
+
+        .instruction-box {
+            background-color: #f8fafc;
+            border-left: 4px solid var(--primary-color);
+            padding: 12px 16px;
+            text-align: left;
+            border-radius: 0 8px 8px 0;
+            font-size: 14px;
+            color: var(--text-muted);
+        }
+    </style>
+</head>
+<body>
+
+    <div class="test-container">
+        <div class="status-badge">
+            <span class="status-dot"></span>
+            Local Environment Active
+        </div>
+        
+        <h1>የ ESS ቻትቦት የሙከራ ገጽ</h1>
+        <p>ቻትቦቱ በትክክል እንዲሰራ ተዋቅሯል። እባክዎ ከታች በቀኝ በኩል የሚገኘውን ምልክት በመጫን ይሞክሩት።</p>
+
+        <div class="instruction-box">
+            <strong>Tip:</strong> Make sure your local Flask development server is running on port 5000.
+        </div>
+    </div>
+
+    <!-- የቻትቦት መግብር ሎደር (Loader) ኮድ -->
+    <script src="http://localhost:5000/static/js/ess-embed-loader.js"
+            data-chatbot-url="http://localhost:5000">
+    </script>
+</body>
+</html>

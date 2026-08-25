@@ -23,10 +23,21 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from rag import get_answer, get_answer_stream, ensure_cache_table, CSV_DATA, db_cursor, get_budget_status
+from pdf_extract import extract_document
+from tts_route import tts_bp
 
 STREAM_META_SEP = "\x00__ESS_META__\x00"
 MAX_QUESTION_LENGTH = 1000  # chars — generous for real questions, blocks megabyte-scale abuse
 GUEST_QUESTION_LIMIT = int(os.getenv("GUEST_QUESTION_LIMIT", "5"))  # per-browser-session cap for guests
+
+# ── Uploaded-document config ──
+UPLOAD_MAX_BYTES = 15 * 1024 * 1024   # 15 MB
+UPLOAD_MAX_PAGES = 60                 # pages read from the PDF before truncating
+UPLOAD_ALLOWED_EXTENSIONS = {".pdf"}
+# Caps the whole request body Werkzeug will buffer, not just this route —
+# without it, a huge POST is read into memory in full before our own
+# UPLOAD_MAX_BYTES check in upload_document() ever runs.
+_MAX_CONTENT_LENGTH = UPLOAD_MAX_BYTES + (1 * 1024 * 1024)  # small margin for multipart overhead
 
 # ═══════════════════════════════════════
 # UTF-8 FIX — Defensive Check
@@ -53,13 +64,31 @@ app = Flask(__name__)
 app.secret_key = _resolve_secret_key()
 
 _cookie_secure_default = os.getenv("FLASK_ENV") == "production"
+_cookie_secure = os.getenv(
+    "FLASK_COOKIE_SECURE",
+    "true" if _cookie_secure_default else "false"
+).lower() == "true"
 app.config.update(
     SESSION_COOKIE_HTTPONLY = True,
-    SESSION_COOKIE_SAMESITE = "Lax",
-    SESSION_COOKIE_SECURE   = os.getenv(
-        "FLASK_COOKIE_SECURE",
-        "true" if _cookie_secure_default else "false"
-    ).lower() == "true",
+    # The /widget page runs inside an <iframe> embedded on the ESS website's
+    # own domain (see ess-embed-loader.js) — a DIFFERENT origin than this
+    # Flask app. Browsers treat every fetch() made from inside that iframe
+    # as a cross-site request relative to the host page, so a "Lax" cookie
+    # (the old value here) was silently dropped on every widget request:
+    # /guest_status, /api/login, /get_sessions, /ask_stream, etc. never
+    # carried the session cookie, which is why login + chat history worked
+    # fine on the full-page /chat route (same-site) but appeared to reset
+    # constantly inside the embedded widget popup (cross-site).
+    #
+    # "None" is required to allow the cookie on cross-site requests, but
+    # browsers only honor SameSite=None when Secure=True (HTTPS). Locally
+    # over plain http, None+Secure cookies are rejected outright, so we
+    # fall back to Lax there — the widget's cross-site case can't be
+    # properly tested over http anyway; use HTTPS (e.g. an ngrok/caddy
+    # tunnel) to reproduce and verify the embedded-widget login flow.
+    SESSION_COOKIE_SAMESITE = "None" if _cookie_secure else "Lax",
+    SESSION_COOKIE_SECURE   = _cookie_secure,
+    MAX_CONTENT_LENGTH = _MAX_CONTENT_LENGTH,
 )
 
 csrf = CSRFProtect(app)
@@ -69,6 +98,15 @@ def csrf_token():
     return jsonify({"csrf_token": generate_csrf()})
 
 limiter = Limiter(get_remote_address, app=app, default_limits=[])
+
+# /tts (server-side Amharic speech synthesis, see tts_route.py). It doesn't
+# touch the DB or session, and already has its own per-IP rate limit, so it
+# doesn't need a CSRF token — but it DOES need to be explicitly exempted,
+# or CSRFProtect(app) above rejects the plain fetch() the Listen button
+# sends (chat.js/widget.js don't attach X-CSRFToken to this call, unlike
+# /ask_stream and /upload_document which do).
+app.register_blueprint(tts_bp)
+csrf.exempt(tts_bp)
 
 # ═══════════════════════════════════════
 # LOGGING
@@ -228,6 +266,62 @@ def append_guest_history(question: str, answer: str):
             for k in [k for k, (_, ts) in _GUEST_HISTORY_STORE.items() if ts < cutoff]:
                 del _GUEST_HISTORY_STORE[k]
 
+# ═══════════════════════════════════════
+# UPLOADED DOCUMENT — per-browser-session, in-memory (not the ESS corpus)
+# ═══════════════════════════════════════
+# Same reasoning as _GUEST_HISTORY_STORE above: the extracted text can be up
+# to UPLOAD_MAX_CHARS-worth of characters, too big/volatile for the session
+# cookie, and needs to survive across the streaming response. Keyed by a
+# random per-browser token (works for guests AND logged-in users — unlike
+# guest_token, this is set regardless of login state).
+UPLOAD_TTL_SECONDS = 2 * 3600
+_UPLOAD_STORE = {}
+_UPLOAD_LOCK = threading.Lock()
+
+
+def _get_or_create_upload_token() -> str:
+    token = session.get("upload_token")
+    if not token:
+        token = uuid.uuid4().hex
+        session["upload_token"] = token
+    return token
+
+
+def get_uploaded_document() -> dict:
+    """Returns {"filename": ..., "text": ...} if this browser session has an
+    active uploaded document, else None."""
+    token = session.get("upload_token")
+    if not token:
+        return None
+    with _UPLOAD_LOCK:
+        entry = _UPLOAD_STORE.get(token)
+        if not entry:
+            return None
+        data, last_seen = entry
+        if time.time() - last_seen > UPLOAD_TTL_SECONDS:
+            del _UPLOAD_STORE[token]
+            return None
+    return data
+
+
+def set_uploaded_document(filename: str, text: str):
+    token = _get_or_create_upload_token()
+    with _UPLOAD_LOCK:
+        _UPLOAD_STORE[token] = ({"filename": filename, "text": text}, time.time())
+        if len(_UPLOAD_STORE) > 5000:
+            cutoff = time.time() - UPLOAD_TTL_SECONDS
+            for k in [k for k, (_, ts) in _UPLOAD_STORE.items() if ts < cutoff]:
+                del _UPLOAD_STORE[k]
+
+
+def clear_uploaded_document():
+    token = session.get("upload_token")
+    if not token:
+        return
+    with _UPLOAD_LOCK:
+        _UPLOAD_STORE.pop(token, None)
+
+
 def _owns_session(user_id: int, session_id: int) -> bool:
     try:
         with db_cursor() as cur:
@@ -379,8 +473,134 @@ def logout():
     return redirect(url_for("login"))
 
 # ═══════════════════════════════════════
+# JSON AUTH — used ONLY by the popup widget (static/js/widget.js). The
+# regular /login, /register, /logout above render full HTML pages and
+# redirect on success, which is why the popup previously had to leave
+# the iframe (target="_blank") to sign in at all. These mirror the exact
+# same validation/session logic but respond with JSON and never redirect,
+# so the widget can authenticate in place and keep the popup open.
+# ═══════════════════════════════════════
+@app.route("/api/login", methods=["POST"])
+@limiter.limit("10 per minute")
+def api_login():
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = (data.get("password") or "").strip()
+
+    if not username or not password:
+        return jsonify({"error": "Username and password are required."}), 400
+
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT id, username, password_hash FROM users WHERE username=%s",
+                (username,)
+            )
+            user = cur.fetchone()
+
+        if not user or not check_password_hash(user[2], password):
+            return jsonify({"error": "Invalid username or password."}), 401
+
+        session["user_id"]  = user[0]
+        session["username"] = user[1]
+        log.info(f"User logged in via widget: {username}")
+        return jsonify({"success": True, "username": user[1]})
+
+    except Exception:
+        log.exception("Widget login error")
+        return jsonify({"error": "Login failed. Please try again."}), 500
+
+
+@app.route("/api/register", methods=["POST"])
+@limiter.limit("10 per minute")
+def api_register():
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    email    = (data.get("email") or "").strip()
+    password = (data.get("password") or "").strip()
+
+    if not username or not email or not password:
+        return jsonify({"error": "All fields are required."}), 400
+    if not USERNAME_RE.match(username):
+        return jsonify({"error": "Username must be 3-30 characters: letters, numbers, underscore only."}), 400
+    if not EMAIL_RE.match(email):
+        return jsonify({"error": "Please enter a valid email address."}), 400
+    if len(password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters."}), 400
+
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute(
+                "SELECT id FROM users WHERE username=%s OR email=%s",
+                (username, email)
+            )
+            if cur.fetchone():
+                return jsonify({"error": "Username or email already exists."}), 409
+
+            password_hash = generate_password_hash(password)
+            cur.execute(
+                """INSERT INTO users (username, email, password_hash)
+                   VALUES (%s, %s, %s) RETURNING id""",
+                (username, email, password_hash)
+            )
+            user_id = cur.fetchone()[0]
+
+        session["user_id"]  = user_id
+        session["username"] = username
+        log.info(f"New user registered via widget: {username}")
+        return jsonify({"success": True, "username": username})
+
+    except Exception:
+        log.exception("Widget register error")
+        return jsonify({"error": "Registration failed. Please try again."}), 500
+
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    username = session.get("username", "unknown")
+    session.clear()
+    log.info(f"User logged out via widget: {username}")
+    return jsonify({"success": True})
+
+# ═══════════════════════════════════════
 # ROUTES — CHAT
 # ═══════════════════════════════════════
+
+# ═══════════════════════════════════════
+# ROUTES — EMBEDDABLE POPUP WIDGET
+# Served for the official ESS website's iframe (see
+# static/ess-embed-loader.js). Deliberately guest-only, no login/sidebar —
+# a lighter page than /chat so it loads fast inside a small iframe panel.
+# Reuses /ask_stream, /csrf-token, /suggestions, /guest_status unchanged —
+# same-origin with this route, so no CORS/cross-site-cookie setup needed.
+# ═══════════════════════════════════════
+# Comma-separated list of origins allowed to iframe this route, e.g.
+# "https://www.statsethiopia.gov.et,https://statsethiopia.gov.et". Leave
+# unset only for local testing — an unset/empty value falls back to
+# 'self' only, meaning the widget won't embed anywhere outside this app
+# until the real ESS domain is added here.
+WIDGET_EMBED_ORIGINS = [o.strip() for o in os.getenv("WIDGET_EMBED_ORIGINS", "").split(",") if o.strip()]
+
+@app.route("/widget")
+def widget():
+    resp = app.make_response(render_template("widget.html"))
+    frame_ancestors = "'self' " + " ".join(WIDGET_EMBED_ORIGINS) if WIDGET_EMBED_ORIGINS else "'self'"
+    resp.headers["Content-Security-Policy"] = f"frame-ancestors {frame_ancestors};"
+    return resp
+
+@app.route("/test")
+def test_page():
+    """Local-only page for testing the popup widget (ess-embed-loader.js ->
+    /widget iframe) same-origin with Flask. Opening templates/test.html
+    directly as a file:// path instead of through this route makes Chrome
+    block the loader script entirely ("file: URLs are treated as unique
+    security origins") — this route exists so local testing matches how
+    the widget will actually be embedded (same-origin script load), without
+    needing the real ESS website to test against.
+    Not gated behind FLASK_ENV since it renders a static local test page
+    with no data access — safe to leave enabled, but remove/comment out
+    before deploying if you'd rather not expose it publicly."""
+    return render_template("test.html")
 
 @app.route("/chat")
 @optional_login
@@ -485,6 +705,9 @@ def ask():
 
     question   = (data.get("question") or "").strip()
     session_id = data.get("session_id")
+    force_lang = data.get("ui_lang")
+    if force_lang not in ("en", "am"):
+        force_lang = None
 
     if not question:
         return jsonify({"error": "Empty question"}), 400
@@ -510,8 +733,15 @@ def ask():
         get_guest_history() if user_id is None else None
     )
 
+    uploaded = get_uploaded_document()
+
     try:
-        result = get_answer(question, chat_history=chat_history) or {}
+        result = get_answer(
+            question, chat_history=chat_history,
+            uploaded_context=uploaded["text"] if uploaded else None,
+            uploaded_filename=uploaded["filename"] if uploaded else None,
+            force_lang=force_lang,
+        ) or {}
     except Exception:
         log.exception("RAG pipeline error")
         return jsonify({"error": "Failed to get answer. Please try again."}), 500
@@ -572,6 +802,9 @@ def ask_stream():
 
     question   = (data.get("question") or "").strip()
     session_id = data.get("session_id")
+    force_lang = data.get("ui_lang")
+    if force_lang not in ("en", "am"):
+        force_lang = None
 
     if not question:
         return jsonify({"error": "Empty question"}), 400
@@ -602,11 +835,19 @@ def ask_stream():
         get_guest_history() if user_id is None else None
     )
 
+    uploaded = get_uploaded_document()
+    uploaded_text = uploaded["text"] if uploaded else None
+    uploaded_filename = uploaded["filename"] if uploaded else None
+
     def generate():
         full_answer = ""
         meta = {}
         try:
-            for kind, payload in get_answer_stream(question, chat_history=chat_history):
+            for kind, payload in get_answer_stream(
+                question, chat_history=chat_history,
+                uploaded_context=uploaded_text, uploaded_filename=uploaded_filename,
+                force_lang=force_lang,
+            ):
                 if kind == "chunk":
                     full_answer += payload
                     yield payload
@@ -708,10 +949,80 @@ def delete_session(session_id):
         log.exception("Delete session error")
         return jsonify({"success": False}), 500
 
-@app.route("/suggestions")
-def suggestions():
-    questions = [
-        "What was the inflation rate in Ethiopia in 2018?",
+@app.route("/upload_document", methods=["POST"])
+@optional_login
+@limiter.limit("5 per minute")
+def upload_document():
+    """Accepts a single PDF, extracts its full text (text layer -> OCR
+    fallback -> table extraction, via pdf_extract.extract_document — the
+    same pipeline the bulk indexer uses), and holds it server-side for this
+    browser session. Subsequent /ask and /ask_stream calls answer from this
+    document instead of the ESS corpus until it's cleared."""
+    f = request.files.get("file")
+    if f is None or f.filename == "":
+        return jsonify({"error": "No file provided"}), 400
+
+    filename = f.filename
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in UPLOAD_ALLOWED_EXTENSIONS:
+        return jsonify({"error": "Only PDF files are supported right now."}), 400
+
+    file_bytes = f.read(UPLOAD_MAX_BYTES + 1)
+    if len(file_bytes) > UPLOAD_MAX_BYTES:
+        return jsonify({"error": f"File too large — max {UPLOAD_MAX_BYTES // (1024*1024)} MB."}), 400
+    if not file_bytes:
+        return jsonify({"error": "Uploaded file is empty."}), 400
+
+    try:
+        result = extract_document(file_bytes, max_pages=UPLOAD_MAX_PAGES)
+    except Exception:
+        log.exception(f"Upload extraction failed for '{filename}'")
+        return jsonify({"error": "Could not read that PDF — it may be corrupted or password-protected."}), 400
+
+    if not result["text"]:
+        return jsonify({
+            "error": "No readable text found in this PDF, even with OCR. "
+                     "If it's a scanned document, make sure it's clear/high-resolution."
+        }), 400
+
+    set_uploaded_document(filename, result["text"])
+    log.info(
+        f"User {current_username()} uploaded '{filename}' — "
+        f"{result['pages_total']} pages ({result['pages_ocrd']} via OCR, "
+        f"{result['pages_empty']} unreadable), {result['tables_found']} tables, "
+        f"truncated={result['truncated']}"
+    )
+
+    return jsonify({
+        "filename": filename,
+        "pages_total": result["pages_total"],
+        "pages_ocrd": result["pages_ocrd"], 
+        "pages_empty": result["pages_empty"],
+        "tables_found": result["tables_found"],
+        "ocr_available": result["ocr_available"],
+        "truncated": result["truncated"],
+    })
+
+
+@app.route("/clear_upload", methods=["POST"])
+@optional_login
+def clear_upload():
+    clear_uploaded_document()
+    return jsonify({"cleared": True})
+
+
+@app.route("/upload_status")
+@optional_login
+def upload_status():
+    """Lets the frontend restore the 'attached file' chip after a page
+    reload, since the extracted text lives server-side, not in the DOM."""
+    uploaded = get_uploaded_document()
+    return jsonify({"filename": uploaded["filename"] if uploaded else None})
+
+
+SUGGESTIONS_BY_LANG = {
+    "en": [
+        "What was the inflation rate in EFY 2018?",
         "Tell me about livestock production in Ethiopia",
         "What is the land utilization in Amhara region?",
         "How many households are in the survey?",
@@ -719,7 +1030,23 @@ def suggestions():
         "Tell me about the demographic health survey",
         "What is the population of Ethiopia?",
         "Describe the agricultural survey findings"
-    ]
+    ],
+    "am": [
+        "በ2018 ዓ.ም (EFY) የኢትዮጵያ የዋጋ ግሽበት መጠን ስንት ነበር?",
+        "ስለ ኢትዮጵያ የከብት እርባታ ንገረኝ",
+        "በአማራ ክልል የመሬት አጠቃቀም ምንድን ነው?",
+        "በጥናቱ ምን ያህል ቤተሰቦች ተካተዋል?",
+        "የ2022 ስታቲስቲክስ ሪፖርት ምን ይላል?",
+        "ስለ ስነ-ሕዝብ ጤና ጥናት ንገረኝ",
+        "የኢትዮጵያ ህዝብ ብዛት ስንት ነው?",
+        "የግብርና ጥናት ግኝቶችን ግለጽ"
+    ],
+}
+
+@app.route("/suggestions")
+def suggestions():
+    lang = request.args.get("lang", "en")
+    questions = SUGGESTIONS_BY_LANG.get(lang, SUGGESTIONS_BY_LANG["en"])
     return jsonify({"suggestions": questions})
 
 @app.route("/guest_status")
@@ -727,7 +1054,8 @@ def guest_status():
     return jsonify({
         "is_guest": current_user_id() is None,
         "remaining": guest_questions_remaining() if current_user_id() is None else None,
-        "limit": GUEST_QUESTION_LIMIT
+        "limit": GUEST_QUESTION_LIMIT,
+        "username": session.get("username") if current_user_id() is not None else None
     })
 
 @app.route("/health")

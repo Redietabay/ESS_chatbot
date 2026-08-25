@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
+<title>ESS Assistant</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/widget.css') }}">
+</head>
+<body>
+  <div id="widgetRoot">
+    <div class="w-header">
+      <div class="w-header-brand">
+        <img src="{{ url_for('static', filename='images/logo.png') }}" alt="ESS Logo" class="w-header-logo">
+        <div class="w-header-titles">
+          <span class="w-header-title-main"><span class="w-dot"></span>ESS Assistant</span>
+          <span class="w-header-title-sub">Ethiopian Statistical Service</span>
+        </div>
+      </div>
+      <div class="w-header-actions">
+        <div class="w-lang-toggle" id="wUiLangToggle">
+          <button type="button" data-lang="en" class="active">EN</button>
+          <button type="button" data-lang="am">አማ</button>
+        </div>
+        <button id="wCloseBtn" class="w-close-btn" title="Close" type="button">&times;</button>
+      </div>
+    </div>
+
+    <div id="wHistoryPanel" class="w-history-panel" style="display:none;"></div>
+
+    <div id="wMessages" class="w-messages">
+      <div class="w-welcome">
+        <p id="wWelcomeText">👋 Hi! Ask me about Ethiopian census data, economic surveys, livestock metrics, or inflation rates.</p>
+      </div>
+      <div id="wSuggestions" class="w-suggestions"></div>
+    </div>
+
+    <div id="wMicStatus" class="w-mic-status"></div>
+
+    <div class="w-input-area">
+      <textarea id="wInput" class="w-input" rows="1"
+                placeholder="Type your question..." maxlength="1000"></textarea>
+      <button id="wSendBtn" class="w-send-btn" type="button" title="Send">➤</button>
+    </div>
+    <div id="wAuthPanel" class="w-auth-panel" style="display:none;"></div>
+    <div id="wGuestBanner" class="w-guest-banner"></div>
+  </div>
+
+  <script src="{{ url_for('static', filename='js/widget.js') }}"></script>
+</body>
+</html>

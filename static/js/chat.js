@@ -8,6 +8,91 @@ let recognition;
 let isListening = false;
 let currentLanguage = 'en-US'; // Default Language
 
+// UI (interface chrome) strings — separate from currentLanguage above,
+// which only controls what language speech-to-text listens for.
+const UI_STRINGS = {
+    en: {
+        welcomeTitle: 'እንኳን ደህና መጡ! 👋',
+        welcomeSubtitle: 'Ask me anything about Ethiopian census data, economic surveys, livestock metrics, or inflation rates.',
+        placeholder: 'Type your data question here... (Press Enter to send)',
+        listening: 'Listening... Speak now!',
+        attachTitle: 'Attach a PDF to ask questions about it',
+        micTitle: 'Speak your question'
+    },
+    am: {
+        welcomeTitle: 'እንኳን ደህና መጡ! 👋',
+        welcomeSubtitle: 'ስለ ኢትዮጵያ የህዝብ ቆጠራ፣ የኢኮኖሚ ጥናቶች፣ የከብት እርባታ መረጃ ወይም የዋጋ ግሽበት ይጠይቁኝ።',
+        placeholder: 'ጥያቄዎን እዚህ ይጻፉ... (ለመላክ Enter ይጫኑ)',
+        listening: 'በማዳመጥ ላይ... አሁን ይናገሩ!',
+        attachTitle: 'ጥያቄ ለመጠየቅ PDF ያያይዙ',
+        micTitle: 'ጥያቄዎን ይናገሩ'
+    }
+};
+let uiLang = 'en';
+
+function injectUiLangToggle() {
+    const toggle = document.getElementById('uiLangToggle');
+    if (!toggle) return;
+    toggle.querySelectorAll('button').forEach(btn => {
+        btn.addEventListener('click', () => setUiLang(btn.dataset.lang));
+    });
+}
+
+function setUiLang(lang) {
+    if (!UI_STRINGS[lang]) return;
+    uiLang = lang;
+    const t = UI_STRINGS[lang];
+
+    const toggle = document.getElementById('uiLangToggle');
+    if (toggle) {
+        toggle.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.lang === lang));
+    }
+
+    const titleEl = document.getElementById('welcomeTitle');
+    if (titleEl) titleEl.textContent = t.welcomeTitle;
+    const subtitleEl = document.getElementById('welcomeSubtitle');
+    if (subtitleEl) subtitleEl.textContent = t.welcomeSubtitle;
+
+    if (!isListening) questionInput.placeholder = t.placeholder;
+
+    const attachBtn = document.getElementById('attachBtn');
+    if (attachBtn) attachBtn.title = t.attachTitle;
+
+    const micBtn = document.getElementById('micBtn');
+    if (micBtn) micBtn.title = t.micTitle;
+
+    // Refresh the suggestion chips in the new language too (only relevant
+    // on the still-empty welcome screen; a no-op once a chat has started).
+    if (document.getElementById('suggestionsGrid')) loadSuggestions();
+}
+
+// Replaces alert() for upload/mic feedback — alert() blocks the whole tab
+// and looks broken on mobile; an inline toast doesn't interrupt typing.
+function showToast(msg, type) {
+    const inputArea = document.querySelector('.input-area');
+    if (!inputArea) return;
+    const old = document.getElementById('essToast');
+    if (old) old.remove();
+
+    const toast = document.createElement('div');
+    toast.id = 'essToast';
+    toast.className = `toast ${type === 'error' ? 'toast-error' : 'toast-success'}`;
+    toast.textContent = msg;
+    inputArea.insertBefore(toast, inputArea.firstChild);
+
+    setTimeout(() => { if (toast.parentNode) toast.remove(); }, type === 'error' ? 5000 : 3500);
+}
+
+function showMicStatus(msg) {
+    const el = document.getElementById('micStatus');
+    if (!el) return;
+    el.textContent = msg;
+    clearTimeout(showMicStatus._t);
+    if (msg) {
+        showMicStatus._t = setTimeout(() => { el.textContent = ''; }, 4000);
+    }
+}
+
 // Dynamic CSRF fetcher
 async function getCsrfToken() {
     try {
@@ -29,14 +114,185 @@ const chatTitle = document.getElementById('chatTitle');
 const suggestionsGrid = document.getElementById('suggestionsGrid');
 
 document.addEventListener('DOMContentLoaded', () => {
+    injectUiLangToggle();
     loadSuggestions();
     setupSessionClickHandlers();
     setupInputListeners();
     injectLanguageSelector(); // Inject Amharic / Afaan Oromoo / English selector
     initSpeechRecognition();
     loadChartJS(); // Load Chart.js dynamically to save loading time
+    injectFileUpload(); // Inject the 📎 attach-document button + chip
+    restoreUploadedFileChip(); // Show the chip again if a doc survived a page reload
     if (window.IS_GUEST) initGuestBanner();
 });
+
+// ═══════════════════════════════════════
+// FILE UPLOAD — attach a PDF and ask questions about it directly
+// (server-side text/table/OCR extraction happens in /upload_document;
+// see pdf_extract.py). While a file is attached, /ask_stream answers from
+// it instead of the ESS corpus — see the chip's remove (×) button to
+// go back to normal ESS Q&A.
+// ═══════════════════════════════════════
+let attachedFilename = null;
+
+function injectFileUpload() {
+    const inputRow = document.querySelector('.input-row');
+    if (!inputRow || document.getElementById('fileUploadInput')) return;
+
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.id = 'fileUploadInput';
+    fileInput.accept = '.pdf';
+    fileInput.style.display = 'none';
+    fileInput.addEventListener('change', handleFileSelected);
+    document.body.appendChild(fileInput);
+
+    const attachBtn = document.createElement('button');
+    attachBtn.id = 'attachBtn';
+    attachBtn.type = 'button';
+    attachBtn.title = 'Attach a PDF to ask questions about it';
+    attachBtn.className = 'attach-btn';
+    attachBtn.innerHTML = '📎';
+    attachBtn.addEventListener('click', () => fileInput.click());
+    inputRow.insertBefore(attachBtn, questionInput);
+}
+
+async function restoreUploadedFileChip() {
+    try {
+        const res = await fetch('/upload_status');
+        const data = await res.json();
+        if (data.filename) {
+            attachedFilename = data.filename;
+            showAttachedFileChip(data.filename);
+        }
+    } catch (e) { /* non-fatal */ }
+}
+
+const MAX_UPLOAD_MB = 15; // matches app.py's UPLOAD_MAX_BYTES exactly
+
+async function handleFileSelected(e) {
+    const file = e.target.files[0];
+    e.target.value = ''; // allow re-selecting the same file later
+    if (!file) return;
+
+    // Client-side validation first — instant feedback, no round trip.
+    if (!/\.pdf$/i.test(file.name)) {
+        showToast('Only PDF files are supported.', 'error');
+        return;
+    }
+    if (file.size > MAX_UPLOAD_MB * 1024 * 1024) {
+        showToast(`"${file.name}" is over ${MAX_UPLOAD_MB}MB — please upload a smaller file.`, 'error');
+        return;
+    }
+
+    const attachBtn = document.getElementById('attachBtn');
+    if (attachBtn) { attachBtn.innerHTML = '⏳'; attachBtn.disabled = true; }
+    showUploadingChip(file.name);
+
+    try {
+        const token = await getCsrfToken();
+        const formData = new FormData();
+        formData.append('file', file);
+
+        const res = await fetch('/upload_document', {
+            method: 'POST',
+            headers: { 'X-CSRFToken': token },
+            body: formData
+        });
+
+        if (res.status === 429) {
+            const chip = document.getElementById('uploadChip');
+            if (chip) chip.remove();
+            showToast("You're uploading too quickly — wait a moment and try again.", 'error');
+            return;
+        }
+        if (res.status === 413) {
+            const chip = document.getElementById('uploadChip');
+            if (chip) chip.remove();
+            showToast(`File is too large — max ${MAX_UPLOAD_MB}MB.`, 'error');
+            return;
+        }
+        const data = await res.json();
+
+        if (!res.ok) {
+            const chip = document.getElementById('uploadChip');
+            if (chip) chip.remove();
+            showToast(data.error || 'Could not process that file.', 'error');
+            return;
+        }
+
+        attachedFilename = data.filename;
+        showAttachedFileChip(data.filename, data);
+        showToast(`"${data.filename}" is ready — ask a question about it.`, 'success');
+    } catch (err) {
+        console.error('Upload failed:', err);
+        const chip = document.getElementById('uploadChip');
+        if (chip) chip.remove();
+        showToast('Upload failed — check your connection and try again.', 'error');
+    } finally {
+        if (attachBtn) { attachBtn.innerHTML = '📎'; attachBtn.disabled = false; }
+    }
+}
+
+function showUploadingChip(filename) {
+    let chip = document.getElementById('uploadChip');
+    const inputArea = document.querySelector('.input-area');
+    if (!chip && inputArea) {
+        chip = document.createElement('div');
+        chip.id = 'uploadChip';
+        inputArea.insertBefore(chip, inputArea.firstChild);
+    }
+    if (!chip) return;
+    chip.className = 'upload-chip uploading';
+    chip.innerHTML = `<span class="upload-chip-spinner"></span><span>Uploading ${escapeHtml(filename)}...</span>`;
+}
+
+function showAttachedFileChip(filename, stats) {
+    let chip = document.getElementById('uploadChip');
+    const inputArea = document.querySelector('.input-area');
+    if (!chip && inputArea) {
+        chip = document.createElement('div');
+        chip.id = 'uploadChip';
+        chip.className = 'upload-chip';
+        inputArea.insertBefore(chip, inputArea.firstChild);
+    }
+    if (!chip) return;
+    chip.className = 'upload-chip';
+
+    let warning = '';
+    if (stats && stats.pages_empty > 0) {
+        warning = ` <span class="upload-chip-warn">(${stats.pages_empty} page(s) unreadable${stats.ocr_available ? '' : ' — OCR unavailable'})</span>`;
+    }
+    if (stats && stats.truncated) {
+        warning += ` <span class="upload-chip-warn">(document was long — only the first pages were read)</span>`;
+    }
+
+    chip.innerHTML = `
+        <span class="upload-chip-icon">📄</span>
+        <span class="upload-chip-name">${escapeHtml(filename)}</span>${warning}
+        <button type="button" class="upload-chip-remove" title="Remove attached file">&times;</button>
+    `;
+    chip.querySelector('.upload-chip-remove').addEventListener('click', removeAttachedFile);
+}
+
+async function removeAttachedFile() {
+    try {
+        const token = await getCsrfToken();
+        await fetch('/clear_upload', {
+            method: 'POST',
+            headers: { 'X-CSRFToken': token }
+        });
+    } catch (e) { /* non-fatal — chip removal proceeds either way */ }
+    attachedFilename = null;
+    const chip = document.getElementById('uploadChip');
+    if (chip) chip.remove();
+}
+
+function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
 
 // GUEST QUOTA BANNER
 function initGuestBanner() {
@@ -116,7 +372,7 @@ function showGuestLimitPrompt(message) {
 async function loadSuggestions() {
     if (!suggestionsGrid) return;
     try {
-        const res = await fetch('/suggestions');
+        const res = await fetch(`/suggestions?lang=${uiLang}`);
         const data = await res.json();
         if (data.suggestions && data.suggestions.length > 0) {
             suggestionsGrid.innerHTML = '';
@@ -153,9 +409,7 @@ function setupSessionClickHandlers() {
             return;
         }
 
-        if ('speechSynthesis' in window) {
-            window.speechSynthesis.cancel();
-        }
+        stopSpeaking();
 
         await loadChatHistory(sessionId);
     });
@@ -213,9 +467,7 @@ async function startNewChat() {
     currentSessionId = null;
     chatTitle.textContent = "New Chat";
 
-    if ('speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
-    }
+    stopSpeaking();
 
     messagesArea.innerHTML = `
         <div class="welcome-box">
@@ -238,9 +490,7 @@ async function handleSend() {
 
     questionInput.value = '';
 
-    if ('speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
-    }
+    stopSpeaking();
 
     if (!currentSessionId && !window.IS_GUEST) {
         const token = await getCsrfToken();
@@ -280,7 +530,11 @@ async function handleSend() {
                 'Content-Type': 'application/json',
                 'X-CSRFToken': token
             },
-            body: JSON.stringify({ question: question, session_id: currentSessionId })
+            // ui_lang tells the backend which language the EN/አማ toggle is
+            // set to (see force_lang in rag.py) — without this the toggle
+            // only changed cosmetic chrome text and never changed what
+            // language the bot actually answered in.
+            body: JSON.stringify({ question: question, session_id: currentSessionId, ui_lang: uiLang })
         });
 
         removeTypingIndicator(typingIndicator);
@@ -388,7 +642,7 @@ function appendMessageBubble(sender, text, sourceDoc = null, sourcePage = null) 
         speakBtn.style.marginLeft = '10px';
         speakBtn.addEventListener('click', () => {
             const targetText = textSpan.innerText || textSpan.textContent;
-            speakText(targetText, msgDiv.dataset.answerLang);
+            speakText(targetText, msgDiv.dataset.answerLang, speakBtn);
         });
 
         // Voice Stop Button
@@ -396,11 +650,7 @@ function appendMessageBubble(sender, text, sourceDoc = null, sourcePage = null) 
         stopBtn.className = 'stop-btn';
         stopBtn.innerHTML = '🔇 Stop';
         stopBtn.style.marginLeft = '10px';
-        stopBtn.addEventListener('click', () => {
-            if ('speechSynthesis' in window) {
-                window.speechSynthesis.cancel();
-            }
-        });
+        stopBtn.addEventListener('click', stopSpeaking);
 
         actionsDiv.appendChild(copyBtn);
         actionsDiv.appendChild(speakBtn);
@@ -461,6 +711,38 @@ function scrollToBottom() {
     messagesArea.scrollTop = messagesArea.scrollHeight;
 }
 
+// Markdown table (rows of "| a | b |" with a "|---|---|" separator row)
+// -> a real HTML <table>. Consumes the table's lines and returns how many
+// lines (starting at `start`) it used, so the caller can skip past them.
+function _consumeMarkdownTable(lines, start) {
+    const isRow = i => i < lines.length && lines[i].trim().startsWith('|');
+    const isSep = i => isRow(i) && /^\|?\s*:?-{2,}/.test(lines[i].trim().replace(/^\|/, ''));
+
+    if (!isRow(start) || !isSep(start + 1)) return null;
+
+    const toCells = line => line.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+
+    const header = toCells(lines[start]);
+    let i = start + 2; // skip header + separator rows
+    const bodyRows = [];
+    while (isRow(i) && !isSep(i)) {
+        bodyRows.push(toCells(lines[i]));
+        i++;
+    }
+
+    let html = '<div class="md-table-wrap"><table class="md-table"><thead><tr>';
+    header.forEach(c => { html += `<th>${c}</th>`; });
+    html += '</tr></thead><tbody>';
+    bodyRows.forEach(row => {
+        html += '<tr>';
+        header.forEach((_, ci) => { html += `<td>${row[ci] !== undefined ? row[ci] : ''}</td>`; });
+        html += '</tr>';
+    });
+    html += '</tbody></table></div>';
+
+    return { html, linesConsumed: i - start };
+}
+
 function formatMarkdown(text) {
     if (!text) return "";
     let clean = text
@@ -468,11 +750,33 @@ function formatMarkdown(text) {
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;");
 
-    clean = clean.replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>');
+    // Pull fenced code blocks + tables out into placeholders BEFORE the
+    // line-by-line <p>-wrap below, so multi-line blocks survive the split
+    // intact instead of getting one <p> per line.
+    const blocks = [];
+    clean = clean.replace(/```([\s\S]*?)```/g, (match, code) => {
+        blocks.push(`<pre><code>${code}</code></pre>`);
+        return `\u0000BLOCK${blocks.length - 1}\u0000`;
+    });
     clean = clean.replace(/`([^`\n]+)`/g, '<code>$1</code>');
     clean = clean.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
 
-    return clean.split('\n').map(line => line.trim() ? `<p>${line}</p>` : '').join('');
+    const srcLines = clean.split('\n');
+    const outLines = [];
+    for (let i = 0; i < srcLines.length; i++) {
+        const table = _consumeMarkdownTable(srcLines, i);
+        if (table) {
+            blocks.push(table.html);
+            outLines.push(`\u0000BLOCK${blocks.length - 1}\u0000`);
+            i += table.linesConsumed - 1;
+            continue;
+        }
+        outLines.push(srcLines[i]);
+    }
+
+    let html = outLines.map(line => line.trim() ? `<p>${line}</p>` : '').join('');
+    html = html.replace(/<p>\u0000BLOCK(\d+)\u0000<\/p>/g, (match, i) => blocks[Number(i)]);
+    return html;
 }
 
 // 5. SIDEBAR UPDATES
@@ -569,36 +873,110 @@ function fallbackCopyText(text, buttonElement) {
 }
 
 // 7. TEXT-TO-SPEECH
+// Hybrid strategy:
+//  - English almost always has a decent built-in browser voice -> use the
+//    free, instant, zero-network Web Speech API for it.
+//  - Amharic and (especially) Afaan Oromoo voices are missing on nearly
+//    every desktop/Android/iOS browser. Setting utterance.lang = 'am-ET' or
+//    'om-ET' when no such voice is installed does NOT fail loudly — it
+//    silently substitutes a default (usually English) voice, which is what
+//    produced the "wrong sound" bug. So for am/om we ask the backend's
+//    /tts endpoint (server-side gTTS — free, no API key) to render real
+//    audio instead, and only fall back to the broken browser voice if that
+//    request fails, so something still plays rather than nothing.
 const LANG_TO_TTS_LOCALE = { en: 'en-US', am: 'am-ET', om: 'om-ET' };
+const TTS_ENDPOINT = '/tts';
 
-function speakText(text, answerLang) {
-    if (!('speechSynthesis' in window)) {
-        console.warn("Speech Synthesis not supported.");
-        return;
+let _activeTtsAudio = null;
+
+function stopSpeaking() {
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    if (_activeTtsAudio) {
+        _activeTtsAudio.pause();
+        _activeTtsAudio.src = '';
+        _activeTtsAudio = null;
     }
+}
 
-    window.speechSynthesis.cancel();
+function hasBrowserVoiceFor(localePrefix) {
+    if (!('speechSynthesis' in window)) return false;
+    const voices = window.speechSynthesis.getVoices();
+    // Voice list loads async in some browsers; if it's empty we haven't
+    // heard back yet — assume yes rather than blocking English playback.
+    if (!voices.length) return true;
+    return voices.some(v => v.lang && v.lang.toLowerCase().startsWith(localePrefix));
+}
 
-    let cleanText = text.replace(/[*_`#]/g, '')
-                        .replace(/<\/?[^>]+(>|$)/g, "");
+async function speakText(text, answerLang, btnEl) {
+    stopSpeaking();
 
-    const utterance = new SpeechSynthesisUtterance(cleanText);
+    const cleanText = text.replace(/[*_`#]/g, '')
+                           .replace(/<\/?[^>]+(>|$)/g, "")
+                           .trim();
+    if (!cleanText) return;
 
     // Prefer the language the backend actually answered in (passed through
     // the stream metadata). Afaan Oromoo is written in Latin script, so
-    // guessing from character ranges can never distinguish it from English —
-    // this is the fix for that. Script-sniffing is kept only as a fallback
-    // for older cached bubbles that don't carry a language tag.
-    if (answerLang && LANG_TO_TTS_LOCALE[answerLang]) {
-        utterance.lang = LANG_TO_TTS_LOCALE[answerLang];
-    } else if (/[\u1200-\u137F]/.test(cleanText)) {
-        utterance.lang = 'am-ET';
-    } else {
-        utterance.lang = 'en-US';
-    }
-    utterance.rate = 1.0;
+    // guessing from character ranges can never distinguish it from English.
+    // Script-sniffing is kept only as a fallback for older cached bubbles
+    // that don't carry a language tag.
+    const lang = (answerLang && LANG_TO_TTS_LOCALE[answerLang])
+        ? answerLang
+        : (/[\u1200-\u137F]/.test(cleanText) ? 'am' : 'en');
 
-    window.speechSynthesis.speak(utterance);
+    if (lang === 'en' && hasBrowserVoiceFor('en')) {
+        const utterance = new SpeechSynthesisUtterance(cleanText);
+        utterance.lang = 'en-US';
+        utterance.rate = 1.0;
+        window.speechSynthesis.speak(utterance);
+        return;
+    }
+
+    const setBtnLoading = (loading) => {
+        if (!btnEl) return;
+        if (loading) {
+            btnEl.dataset.origLabel = btnEl.innerHTML;
+            btnEl.innerHTML = '⏳ ...';
+            btnEl.disabled = true;
+        } else {
+            btnEl.innerHTML = btnEl.dataset.origLabel || '🔊 Listen';
+            btnEl.disabled = false;
+        }
+    };
+
+    setBtnLoading(true);
+    try {
+        const res = await fetch(`${TTS_ENDPOINT}?lang=${lang}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: cleanText })
+        });
+
+        if (!res.ok) {
+            let detail = null;
+            try { detail = await res.json(); } catch (e) { /* not JSON */ }
+            if (detail && detail.unsupported) {
+                showMicStatus(detail.error || 'Voice for this language is not available yet.');
+                return; // don't fall back to a garbled browser voice for om
+            }
+            throw new Error((detail && detail.error) || `TTS request failed (${res.status})`);
+        }
+
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        _activeTtsAudio = new Audio(url);
+        _activeTtsAudio.play();
+        _activeTtsAudio.onended = () => URL.revokeObjectURL(url);
+    } catch (e) {
+        console.error('Server TTS failed, falling back to browser voice:', e);
+        if ('speechSynthesis' in window) {
+            const utterance = new SpeechSynthesisUtterance(cleanText);
+            utterance.lang = LANG_TO_TTS_LOCALE[lang] || 'en-US';
+            window.speechSynthesis.speak(utterance);
+        }
+    } finally {
+        setBtnLoading(false);
+    }
 }
 
 // 8. MULTI-LANGUAGE INJECTOR & SPEECH-TO-TEXT
@@ -637,6 +1015,16 @@ function injectLanguageSelector() {
 }
 
 function initSpeechRecognition() {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+    // iOS Safari (and some in-app browsers) have no Web Speech API at all.
+    // Don't inject a mic button that can never work — that's a dead control
+    // with no feedback, which is worse than no button.
+    if (!SpeechRecognition) {
+        console.warn("Speech recognition is not supported in this browser.");
+        return;
+    }
+
     const inputRow = document.querySelector('.input-row');
     if (inputRow && !document.getElementById('micBtn')) {
         const micBtn = document.createElement('button');
@@ -644,16 +1032,10 @@ function initSpeechRecognition() {
         micBtn.id = 'micBtn';
         micBtn.className = 'mic-btn';
         micBtn.innerHTML = '🎙️';
-        micBtn.title = 'Speak your question';
+        micBtn.title = UI_STRINGS[uiLang].micTitle;
 
         inputRow.insertBefore(micBtn, questionInput);
         micBtn.addEventListener('click', toggleMic);
-    }
-
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-        console.warn("Speech recognition is not supported in this browser.");
-        return;
     }
 
     recognition = new SpeechRecognition();
@@ -668,7 +1050,8 @@ function initSpeechRecognition() {
             micBtn.classList.add('recording');
             micBtn.innerHTML = '🔴';
         }
-        questionInput.placeholder = "Listening... Speak now!";
+        questionInput.placeholder = UI_STRINGS[uiLang].listening;
+        showMicStatus('');
     };
 
     recognition.onspeechend = () => {
@@ -682,7 +1065,7 @@ function initSpeechRecognition() {
             micBtn.classList.remove('recording');
             micBtn.innerHTML = '🎙️';
         }
-        questionInput.placeholder = "Type your data question here... (Press Enter to send)";
+        questionInput.placeholder = UI_STRINGS[uiLang].placeholder;
     };
 
     recognition.onresult = (event) => {
@@ -695,25 +1078,39 @@ function initSpeechRecognition() {
         }, 500);
     };
 
+    // Mobile browsers hit these far more than desktop (permission prompts,
+    // flaky data connections) — surface them inline instead of just logging.
     recognition.onerror = (event) => {
         console.error("Speech Recognition Error: ", event.error);
+        const messages = {
+            'not-allowed': 'Microphone access denied — allow it in your browser settings to use voice input.',
+            'service-not-allowed': 'Microphone access denied — allow it in your browser settings to use voice input.',
+            'audio-capture': 'No microphone found on this device.',
+            'no-speech': "Didn't catch that — click the mic and try again.",
+            'network': 'Voice input needs an internet connection.'
+        };
+        showMicStatus(messages[event.error] || 'Voice input failed — please type your question instead.');
         recognition.stop();
     };
 }
 
 function toggleMic() {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-
-    if (!SpeechRecognition) {
-        alert("Your browser does not support Speech Recognition. Please use Google Chrome.");
-        return;
-    }
+    if (!SpeechRecognition) return; // the button wouldn't exist in this case anyway
 
     if (isListening) {
         recognition.stop();
-    } else {
-        recognition.lang = currentLanguage; // sync language
+        return;
+    }
+
+    // Mobile browsers require the mic permission prompt to originate directly
+    // from this click handler — no awaited calls before .start().
+    recognition.lang = currentLanguage; // sync language
+    try {
         recognition.start();
+    } catch (err) {
+        console.error('Mic start failed:', err);
+        showMicStatus('Could not start voice input — please try again.');
     }
 }
 

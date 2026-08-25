@@ -1,6 +1,14 @@
 /* ═══════════════════════════════════════
    GLOBAL & CORE STYLES
    ═══════════════════════════════════════ */
+:root {
+    --ess-deep-blue: #0B3C5D;
+    --ess-accent: #4fc3f7;
+    --ess-danger: #ef4444;
+    --ess-online: #10b981;
+    --ess-warn: #f0a830;
+}
+
 * { 
     box-sizing: border-box; 
     margin: 0; 
@@ -21,7 +29,7 @@ body {
    ═══════════════════════════════════════ */
 .sidebar {
     width: 300px;
-    background: #16213e;
+    background: var(--ess-deep-blue);
     display: flex;
     flex-direction: column;
     padding: 20px;
@@ -187,13 +195,39 @@ body {
 
 .chat-header {
     padding: 18px 24px;
-    background: #16213e;
+    background: var(--ess-deep-blue);
     border-bottom: 1px solid #1e4d8c;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
 }
 
 .chat-header h2 {
     font-size: 1.15rem;
     color: #fff;
+}
+
+/* EN / አማርኛ UI toggle — separate from the mic-language selector below */
+.lang-toggle {
+    display: flex;
+    background: rgba(255,255,255,0.1);
+    border-radius: 6px;
+    padding: 2px;
+    gap: 2px;
+}
+.lang-toggle button {
+    background: none;
+    border: none;
+    color: #cdd8ea;
+    font-size: 0.75rem;
+    padding: 4px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+.lang-toggle button.active {
+    background: var(--ess-accent);
+    color: #06263d;
+    font-weight: 700;
 }
 
 /* Guest question countdown — chat.js writes into this via updateGuestBanner() */
@@ -472,7 +506,7 @@ body {
     border: 1px solid #1e4d8c;
     border-radius: 8px;
     color: #fff;
-    font-size: 0.95rem;
+    font-size: 16px; /* keep >=16px so iOS Safari doesn't auto-zoom the page on focus */
     line-height: 1.5;
     resize: none;
     overflow-y: hidden;
@@ -480,6 +514,52 @@ body {
     outline: none;
     transition: border 0.2s;
 }
+
+.mic-status {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 0 20px;
+    font-size: 0.78rem;
+    color: var(--ess-warn);
+    text-align: center;
+}
+.mic-status:empty { padding: 0; }
+
+/* Transient upload/mic feedback — replaces alert() popups */
+.toast {
+    max-width: 900px;
+    margin: 0 auto 10px auto;
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    animation: toast-in 0.15s ease;
+}
+.toast-error {
+    background: rgba(239, 68, 68, 0.12);
+    border: 1px solid var(--ess-danger);
+    color: #ffb4b4;
+}
+.toast-success {
+    background: rgba(16, 185, 129, 0.12);
+    border: 1px solid var(--ess-online);
+    color: #8ff0cf;
+}
+@keyframes toast-in {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.upload-chip.uploading { border-style: dashed; opacity: 0.9; }
+.upload-chip-spinner {
+    width: 13px;
+    height: 13px;
+    border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.25);
+    border-top-color: var(--ess-accent);
+    animation: chip-spin 0.7s linear infinite;
+    flex-shrink: 0;
+}
+@keyframes chip-spin { to { transform: rotate(360deg); } }
 
 #questionInput:focus {
     border-color: #4fc3f7;
@@ -531,6 +611,72 @@ body {
     border-color: #ef4444;
     animation: pulse-ring 1.5s infinite;
 }
+
+/* 📎 Attach-document button — same shape/feel as .mic-btn */
+.attach-btn {
+    background: #1e4d8c;
+    border: 1px solid #4fc3f7;
+    color: white;
+    border-radius: 8px;
+    width: 44px;
+    height: 44px;
+    cursor: pointer;
+    font-size: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s ease;
+    flex-shrink: 0;
+}
+.attach-btn:hover {
+    background: rgba(79, 195, 247, 0.15);
+    transform: scale(1.05);
+}
+.attach-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+    transform: none;
+}
+
+/* 📄 Attached-file chip, shown above the input row while a document is active */
+.upload-chip {
+    max-width: 900px;
+    margin: 0 auto 10px auto;
+    background: #0f3460;
+    border: 1px solid #4fc3f7;
+    border-radius: 8px;
+    padding: 8px 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.85rem;
+    color: #cdd8ea;
+}
+.upload-chip-icon { flex-shrink: 0; }
+.upload-chip-name {
+    font-weight: 600;
+    color: #4fc3f7;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.upload-chip-warn {
+    color: #f0a830;
+    font-size: 0.78rem;
+}
+.upload-chip-remove {
+    margin-left: auto;
+    background: none;
+    border: none;
+    color: #cdd8ea;
+    font-size: 1.2rem;
+    line-height: 1;
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 4px;
+    flex-shrink: 0;
+}
+.upload-chip-remove:hover { background: rgba(255,255,255,0.08); color: #ef4444; }
 
 @keyframes pulse-ring {
     0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
@@ -627,7 +773,7 @@ body {
     border: 1px solid #1e4d8c;
     border-radius: 6px;
     color: #fff;
-    font-size: 0.95rem;
+    font-size: 16px;
     outline: none;
 }
 
@@ -725,4 +871,22 @@ body {
     .suggestions-grid { 
         grid-template-columns: 1fr; 
     }
+    .chat-header h2 {
+        font-size: 1rem;
+    }
+    .lang-toggle button {
+        padding: 4px 8px;
+        font-size: 0.7rem;
+    }
 }
+/* ── Markdown tables in bot answers ── */
+.md-table-wrap { overflow-x: auto; margin: 8px 0; max-width: 100%; }
+.md-table { border-collapse: collapse; width: 100%; font-size: 0.85em; }
+.md-table th, .md-table td {
+    border: 1px solid #2a3b52;
+    padding: 6px 10px;
+    text-align: left;
+    white-space: nowrap;
+}
+.md-table th { background: #16233a; color: #4fc3f7; font-weight: 600; }
+.md-table tr:nth-child(even) td { background: rgba(255,255,255,0.03); }

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
     <title>ESS Chatbot - Dashboard</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
@@ -59,6 +59,10 @@
     <div class="chat-container">
         <div class="chat-header">
             <h2 id="chatTitle">New Chat</h2>
+            <div class="lang-toggle" id="uiLangToggle">
+                <button type="button" data-lang="en" class="active">EN</button>
+                <button type="button" data-lang="am">አማ</button>
+            </div>
         </div>
 
         {% if is_guest %}
@@ -67,13 +71,15 @@
 
         <div class="messages-area" id="messagesArea">
             <div class="welcome-box">
-                <h3>እንኳን ደህና መጡ! 👋</h3>
-                <p>Ask me anything about Ethiopian census data, economic surveys, livestock metrics, or inflation rates.</p>
+                <h3 id="welcomeTitle">እንኳን ደህና መጡ! 👋</h3>
+                <p id="welcomeSubtitle">Ask me anything about Ethiopian census data, economic surveys, livestock metrics, or inflation rates.</p>
             </div>
 
             <div class="suggestions-grid" id="suggestionsGrid">
                 </div>
         </div>
+
+        <div id="micStatus" class="mic-status"></div>
 
         <div class="input-area">
             <div class="input-row">
