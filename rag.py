@@ -1706,17 +1706,81 @@ def get_language_instructions(lang_code: str) -> str:
 # ═══════════════════════════════════════
 # TERMINOLOGY GLOSSARY (fill this in with ESS staff — native speakers only,
 # never guess these yourself and never trust the LLM's own guess here).
-# Add one entry per row: "English term": "Amharic translation"
-# Every term listed here gets forced into the translation prompt below, so
-# the model uses YOUR approved wording instead of inventing its own.
+# Lives in data/amharic_glossary.json (NOT hardcoded here) specifically so
+# ESS staff can add/edit "English term": "Amharic translation" rows directly
+# in a plain JSON file — no code changes, no redeploy needed for a wording
+# fix. This file is auto-created with the two known-good defaults below on
+# first run if it doesn't exist yet.
+# Every term listed here is now FORCED (via placeholder substitution — see
+# _apply_glossary_placeholders below) into BOTH translation paths: the
+# Google/MyMemory NMT engines AND the Groq LLM fallback. Previously it was
+# only injected into the Groq prompt, so any answer that succeeded via the
+# NMT path (now the common case, post-chunking-fix) never got the forced
+# wording at all.
 # ═══════════════════════════════════════
-GLOSSARY_TERMS = {
+GLOSSARY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "amharic_glossary.json")
+
+_DEFAULT_GLOSSARY_TERMS = {
     "Ethiopian Statistical Service": "የኢትዮጵያ ስታቲስቲክስ አገልግሎት",
     "Meher season": "መኸር",
     "Belg season": "በልግ",
-    # "Household Consumption Expenditure Survey": "",
-    # get remaining terms confirmed by ESS staff (native speakers) and fill in here
 }
+
+
+def _load_glossary_terms() -> dict:
+    """Loads {English term: Amharic translation} from GLOSSARY_FILE. Creates
+    the file with the built-in defaults on first run if missing, so ESS
+    staff have a real file to open and edit right away. Falls back to the
+    in-memory defaults (never crashes the app) if the file is missing,
+    unreadable, or malformed."""
+    try:
+        os.makedirs(os.path.dirname(GLOSSARY_FILE), exist_ok=True)
+        if not os.path.exists(GLOSSARY_FILE):
+            with open(GLOSSARY_FILE, "w", encoding="utf-8") as f:
+                json.dump(_DEFAULT_GLOSSARY_TERMS, f, ensure_ascii=False, indent=2)
+            log.info(f"Created {GLOSSARY_FILE} with {len(_DEFAULT_GLOSSARY_TERMS)} default glossary term(s). "
+                      f"ESS staff can add more rows directly to this file.")
+            return dict(_DEFAULT_GLOSSARY_TERMS)
+        with open(GLOSSARY_FILE, "r", encoding="utf-8") as f:
+            terms = json.load(f)
+        if not isinstance(terms, dict):
+            raise ValueError("glossary file must be a JSON object of {\"English term\": \"Amharic translation\"}")
+        log.info(f"Loaded {len(terms)} glossary term(s) from {GLOSSARY_FILE}.")
+        return terms
+    except Exception as e:
+        log.warning(f"Could not load {GLOSSARY_FILE} ({e}) — using built-in defaults only.")
+        return dict(_DEFAULT_GLOSSARY_TERMS)
+
+
+# Hot-reload cache: ESS staff will keep editing GLOSSARY_FILE after terms
+# get confirmed, and this is a live public widget — requiring an app
+# restart for every wording tweak isn't realistic. _get_glossary_terms()
+# below re-reads the file only when its mtime changes (one cheap stat()
+# call per use, not a re-parse every time), so an edit takes effect on the
+# very next question with no deploy/restart needed. If the file is
+# mid-write or briefly invalid, the last known-good version keeps serving
+# until the next successful read — never a crash, never a gap.
+_glossary_cache = {"terms": _load_glossary_terms(), "mtime": None}
+try:
+    _glossary_cache["mtime"] = os.path.getmtime(GLOSSARY_FILE) if os.path.exists(GLOSSARY_FILE) else None
+except Exception:
+    pass
+
+
+def _get_glossary_terms() -> dict:
+    """Returns the current glossary, auto-reloading from GLOSSARY_FILE when
+    its mtime changes. Use this everywhere instead of a static dict."""
+    try:
+        mtime = os.path.getmtime(GLOSSARY_FILE) if os.path.exists(GLOSSARY_FILE) else None
+    except Exception:
+        mtime = _glossary_cache["mtime"]
+    if mtime != _glossary_cache["mtime"]:
+        reloaded = _load_glossary_terms()
+        if reloaded:  # guards against a transient empty/mid-write read
+            _glossary_cache["terms"] = reloaded
+            _glossary_cache["mtime"] = mtime
+            log.info(f"Glossary file changed — hot-reloaded {len(reloaded)} term(s), no restart needed.")
+    return _glossary_cache["terms"]
 
 # ═══════════════════════════════════════
 # GOOGLE TRANSLATE (Amharic quality fix)
@@ -1749,10 +1813,17 @@ if GOOGLE_TRANSLATE_MODE == "cloud" and GOOGLE_TRANSLATE_API_KEY:
         GOOGLE_TRANSLATE_MODE = "free"
 
 
-def _google_translate(text: str, target_lang: str) -> str:
-    """target_lang: 'am'. Returns '' on any failure/disabled state so
-    the caller falls through to the existing Groq LLM translation — never
-    blocks the user on a translation-provider error."""
+# MyMemory (fallback free engine, below) expects locale-region codes for
+# some languages rather than the bare ISO code the rest of this app uses
+# internally.
+_MYMEMORY_LANG_MAP = {"am": "am-ET"}
+
+
+def _google_translate_single(text: str, target_lang: str) -> str:
+    """One raw call to the free/cloud NMT backends — no chunking. Callers
+    should go through _google_translate() below instead, which chunks long
+    text automatically; call this directly only when you already know
+    `text` is short (< ~450 chars)."""
     if GOOGLE_TRANSLATE_MODE == "off" or not text or not text.strip():
         return ""
 
@@ -1769,19 +1840,224 @@ def _google_translate(text: str, target_lang: str) -> str:
             log.warning(f"Google Cloud Translate failed ({target_lang}): {e}")
             return ""
 
-    # "free" mode — deep-translator
+    # "free" mode — deep-translator, Google engine first
     try:
         from deep_translator import GoogleTranslator
         out = (GoogleTranslator(source="en", target=target_lang).translate(text) or "").strip()
         if out:
             log.info(f"Google Translate (free) succeeded ({target_lang}, {len(out)} chars).")
-        return out
+            return out
     except ImportError:
         log.warning("deep-translator not installed — run 'pip install deep-translator'. Falling back to Groq for translation.")
         return ""
     except Exception as e:
         log.warning(f"Free Google Translate failed ({target_lang}): {e}")
+
+    # Second free engine, tried before giving up on non-Groq translation.
+    # Root cause this covers: on the livestock-question incident
+    # (rag_log.txt), "Free Google Translate failed" and the Groq-based
+    # fallback below BOTH failed in the same turn — Groq was mid-429 from
+    # the CSV retry that had just burned its per-minute budget on the same
+    # request. A translation path that depends on Groq being healthy at
+    # the exact moment Groq is rate-limited is a single point of failure.
+    # MyMemory is a second free, keyless NMT backend with an independent
+    # rate limit/outage profile from both Google's scrape endpoint and Groq,
+    # so it can absorb exactly this "both providers down together" case.
+    try:
+        from deep_translator import MyMemoryTranslator
+        out = (MyMemoryTranslator(source="en-GB", target=_MYMEMORY_LANG_MAP.get(target_lang, target_lang)).translate(text) or "").strip()
+        if out:
+            log.info(f"MyMemory Translate (free, fallback engine) succeeded ({target_lang}, {len(out)} chars).")
+            return out
+    except ImportError:
+        pass  # deep-translator already confirmed importable above; nothing more to log
+    except Exception as e:
+        log.warning(f"MyMemory Translate fallback failed ({target_lang}): {e}")
+
+    return ""
+
+
+# ═══════════════════════════════════════
+# SMART CHUNKING + QUALITY GUARDRAILS (Amharic long-answer fix)
+# ═══════════════════════════════════════
+# Confirmed root cause in rag_log.txt (2026-08-26 16:10): a ~900-char urban
+# population answer was handed to _google_translate_single() whole. The free
+# Google endpoint returned "No translation was found using the current
+# translator" and MyMemory returned "Text length need to be between 0 and
+# 500 characters" — both backends were fed the ENTIRE answer in one call,
+# and MyMemory hard-caps at 500 chars. Fix: split into <450-char pieces on
+# paragraph -> sentence -> (last resort) word boundaries, translate each
+# piece, and reassemble. A quality check on the final result stops a
+# garbled/partial/echoed-error translation from ever reaching the user —
+# on any failure this returns "" so the caller falls through to the
+# existing Groq LLM translation path.
+_MYMEMORY_SAFE_CHARS = 450  # under MyMemory's hard 500-char cap, with headroom
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?።])\s+")
+_AMHARIC_CHAR_RE = re.compile(r"[\u1200-\u137F]")
+_TRANSLATION_FAILURE_MARKERS = (
+    "no translation was found",
+    "text length need to be between",
+    "try another translator",
+    "invalid source language",
+)
+
+
+def _smart_chunk_text(text: str, max_chars: int = _MYMEMORY_SAFE_CHARS) -> list:
+    """Splits `text` into pieces <= max_chars, breaking on paragraph, then
+    sentence, then (last resort) word boundaries — never mid-number,
+    mid-percentage, or mid-word. Returns [text] unchanged if it already
+    fits in one piece."""
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    current = ""
+
+    def flush():
+        nonlocal current
+        if current.strip():
+            chunks.append(current.strip())
+        current = ""
+
+    for para in text.split("\n"):
+        candidate = (current + "\n" + para) if current else para
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+
+        flush()
+        sentences = _SENTENCE_SPLIT_RE.split(para) if para.strip() else [para]
+        for sent in sentences:
+            candidate = (current + " " + sent) if current else sent
+            if len(candidate) <= max_chars:
+                current = candidate
+                continue
+            flush()
+            if len(sent) <= max_chars:
+                current = sent
+                continue
+            # Single sentence still too long (rare) — hard-split on words.
+            piece = ""
+            for w in sent.split(" "):
+                cand = (piece + " " + w) if piece else w
+                if len(cand) <= max_chars:
+                    piece = cand
+                else:
+                    if piece:
+                        chunks.append(piece.strip())
+                    piece = w
+            current = piece
+    flush()
+    return chunks if chunks else [text]
+
+
+def _translation_quality_ok(english_source: str, translated: str) -> bool:
+    """Cheap sanity check so a garbled/partial/failed translation never gets
+    served as if it were good Amharic. Rejects (False) when the result is
+    empty, echoes one of the translator's own error strings, contains no
+    Ge'ez script at all, or is wildly disproportionate in length to the
+    source (a sign of truncation or a stuck retry)."""
+    if not translated or not translated.strip():
+        return False
+    low = translated.lower()
+    if any(marker in low for marker in _TRANSLATION_FAILURE_MARKERS):
+        return False
+    if not _AMHARIC_CHAR_RE.search(translated):
+        return False
+    if english_source:
+        ratio = len(translated) / max(len(english_source), 1)
+        if ratio < 0.25 or ratio > 4.0:
+            return False
+    return True
+
+
+# ═══════════════════════════════════════
+# GLOSSARY ENFORCEMENT (placeholder substitution)
+# ═══════════════════════════════════════
+# Previously GLOSSARY_TERMS was only injected as instructions into the Groq
+# LLM prompt — an NMT engine (Google/MyMemory) never saw it at all, and an
+# LLM prompt is a request, not a guarantee (it can still ignore/reword it).
+# Fix: before ANY translation call, swap each glossary term's English text
+# for a placeholder token that no translator will "helpfully" retranslate
+# or reword (the ⟦...⟧ brackets don't occur in normal ESS text), run the
+# translation, then swap the placeholder back for the EXACT approved
+# Amharic wording. This makes glossary terms deterministic — forced,
+# not requested — across both the NMT and LLM translation paths.
+_GLOSSARY_PLACEHOLDER_FMT = "\u27e6G{idx}\u27e7"  # ⟦G0⟧, ⟦G1⟧, ...
+
+
+def _apply_glossary_placeholders(text: str, target_lang: str) -> tuple:
+    """Returns (protected_text, mapping). mapping is {placeholder: approved
+    Amharic text}, applied in longest-term-first order so a shorter term
+    that's a substring of a longer one (e.g. a future 'Meher' vs 'Meher
+    season') never gets swapped first and breaks the longer match."""
+    glossary_terms = _get_glossary_terms()
+    if target_lang != "am" or not glossary_terms or not text:
+        return text, {}
+
+    mapping = {}
+    protected = text
+    terms = sorted((t for t in glossary_terms.items() if t[1]), key=lambda kv: -len(kv[0]))
+    for idx, (en_term, am_value) in enumerate(terms):
+        placeholder = _GLOSSARY_PLACEHOLDER_FMT.format(idx=idx)
+        pattern = re.compile(r"\b" + re.escape(en_term) + r"\b", re.IGNORECASE)
+        new_protected, n = pattern.subn(placeholder, protected)
+        if n:
+            protected = new_protected
+            mapping[placeholder] = am_value
+    return protected, mapping
+
+
+def _restore_glossary_placeholders(text: str, mapping: dict) -> str:
+    if not mapping or not text:
+        return text
+    for placeholder, am_value in mapping.items():
+        text = text.replace(placeholder, am_value)
+    return text
+
+
+def _google_translate(text: str, target_lang: str) -> str:
+    """Public entry point used everywhere else in this file. Forces glossary
+    terms via placeholder substitution, chunks long text automatically (see
+    _smart_chunk_text — this is what the 500-char MyMemory failures were
+    missing), translates each chunk, reassembles, restores glossary terms,
+    and quality-checks the final result before returning it. Returns '' on
+    any failure so the caller falls through to the Groq LLM translation
+    path — never blocks the user on a translation-provider error."""
+    if GOOGLE_TRANSLATE_MODE == "off" or not text or not text.strip():
         return ""
+
+    protected_text, glossary_map = _apply_glossary_placeholders(text, target_lang)
+    chunks = _smart_chunk_text(protected_text)
+
+    if len(chunks) == 1:
+        out = _google_translate_single(protected_text, target_lang)
+        out = _restore_glossary_placeholders(out, glossary_map)
+        return out if _translation_quality_ok(text, out) else ""
+
+    translated_chunks = []
+    for chunk in chunks:
+        t = _google_translate_single(chunk, target_lang)
+        if not t or not _AMHARIC_CHAR_RE.search(t):
+            # One failed/English-only chunk would poison the whole
+            # reassembled answer (half-Amharic, half-English reads as
+            # broken, not partially working) — abandon the chunked path
+            # entirely and let the caller fall through to Groq for the
+            # FULL text instead.
+            log.warning(f"Chunked Google Translate: chunk {len(translated_chunks) + 1}/{len(chunks)} "
+                        f"failed quality check — abandoning chunked path for this answer.")
+            return ""
+        translated_chunks.append(t)
+
+    result = " ".join(translated_chunks).strip()
+    result = _restore_glossary_placeholders(result, glossary_map)
+    if _translation_quality_ok(text, result):
+        log.info(f"Chunked Google Translate succeeded ({target_lang}, {len(chunks)} chunks, {len(result)} chars).")
+        return result
+
+    log.warning("Chunked Google Translate: reassembled result failed the quality check — falling through to Groq.")
+    return ""
 
 
 # ─── Table-aware translation ───────────────────────────────────────
@@ -1856,12 +2132,12 @@ def _translate_table_segment(table_text: str, target_lang: str, translate_cell) 
 
 
 def _build_glossary_block(target_lang: str) -> str:
-    """Turns GLOSSARY_TERMS into a forced-wording block for the translation
+    """Turns the glossary into a forced-wording block for the translation
     prompt. Only used for 'am' — terms without an Amharic translation are
     skipped."""
     if target_lang != "am":
         return ""
-    rows = [f'  "{en_term}" -> "{val}"' for en_term, val in GLOSSARY_TERMS.items() if val]
+    rows = [f'  "{en_term}" -> "{val}"' for en_term, val in _get_glossary_terms().items() if val]
     if not rows:
         return ""
     return "Mandatory glossary — use this EXACT wording whenever these terms appear, do not translate them any other way:\n" + "\n".join(rows) + "\n\n"
@@ -1883,6 +2159,30 @@ _TRANSLATE_FEW_SHOT = {
         "Amharic: \"በኢትዮጵያ ስታቲስቲክስ አገልግሎት መሠረት፣ የኢትዮጵያ የ2025 ዓ.ም ግምታዊ የሕዝብ ብዛት 110 ሚሊዮን ገደማ ነው።\"\n\n"
     ),
 }
+
+# ═══════════════════════════════════════
+# ACTUAL-LANGUAGE TAGGING (fallback-chain visibility fix)
+# ═══════════════════════════════════════
+# Gap found while tracing the full translation fallback chain: every result
+# dict below sets "language": target_lang — the REQUESTED language, not
+# what was actually served. If Amharic translation exhausts its entire
+# fallback chain (Google free -> MyMemory -> Groq -> Gemini -> Mistral ->
+# OpenRouter -> Cerebras -> Ollama — see translate_answer()/call_groq()) and
+# every tier fails, translate_answer() already degrades gracefully by
+# returning the English answer unchanged. But the response still claimed
+# "language": "am" — so chat.js/widget.js's Listen button (see
+# bubble.dataset.answerLang in widget.js) would fetch the 'am' voice from
+# /tts and read plain English text with Amharic pronunciation. Cheap fix:
+# tag the response with what the text actually IS, not what was asked for.
+def _actual_answer_lang(answer_text: str, requested_lang: str) -> str:
+    """For 'am': if the served text has no Ge'ez script at all, the whole
+    translation fallback chain was exhausted and English was served instead
+    — report 'en' so the frontend (esp. TTS) reacts to reality, not the
+    request. Unchanged for every other case."""
+    if requested_lang == "am" and answer_text and not _AMHARIC_CHAR_RE.search(answer_text):
+        return "en"
+    return requested_lang
+
 
 def translate_answer(english_answer: str, target_lang: str) -> str:
     """Translate a finished English answer into Amharic.
@@ -1938,6 +2238,13 @@ def translate_answer(english_answer: str, target_lang: str) -> str:
     if gt:
         return gt
 
+    # Groq fallback. Glossary terms are forced via the SAME placeholder
+    # substitution used in _google_translate (deterministic — the LLM can't
+    # reword a placeholder token), with the prompt's glossary block kept as
+    # a second, belt-and-suspenders instruction for any term the pattern
+    # match happened to miss (e.g. slightly different phrasing).
+    protected_answer, glossary_map = _apply_glossary_placeholders(english_answer, target_lang)
+
     lang_name = "Amharic (አማርኛ)"
     few_shot = _TRANSLATE_FEW_SHOT.get(target_lang, "")
     glossary = _build_glossary_block(target_lang)
@@ -1948,16 +2255,18 @@ def translate_answer(english_answer: str, target_lang: str) -> str:
 - Translate ONLY — do not add, remove, or reinterpret any information.
 - Preserve every number, statistic, date, and percentage EXACTLY as written.
 - Keep proper nouns, region names, and document/report titles in their recognizable form.
+- Tokens that look like \u27e6G0\u27e7, \u27e6G1\u27e7 etc. are placeholders — copy them into your output EXACTLY as written, unchanged, do not translate or remove them.
 - Output ONLY the translation, nothing else — no notes, no English text alongside it.
 
 English answer:
-\"{english_answer}\"
+\"{protected_answer}\"
 
 {lang_name} translation:"""
 
     translated = call_groq(prompt, retries=2, max_tokens=400, model=MODEL)
-    if is_bad_answer(translated):
-        log.warning(f"Translation to '{target_lang}' failed, falling back to English answer.")
+    translated = _restore_glossary_placeholders(translated, glossary_map) if translated else translated
+    if is_bad_answer(translated) or not _translation_quality_ok(english_answer, translated):
+        log.warning(f"Translation to '{target_lang}' failed quality check, falling back to English answer.")
         return english_answer
     return translated.strip()
 
@@ -2114,6 +2423,38 @@ _LAND_KEYWORDS_MODULE = (
 _PREFERRED_SOURCE_MAP = {
     _LAND_KEYWORDS_MODULE: "national-land-use.pdf",
 }
+
+# Same class of bug as land-utilization above, confirmed in rag_log.txt for
+# "በኢትዮጵያ የእንስሳት ሃብት ምርት መጠን ምን ያህል ነው?" ("what is the livestock production
+# quantity in Ethiopia?"): this general/aggregate question got routed to
+# "csv" (both in Amharic AND in an earlier English run of the same intent),
+# which sends it to query_csv_with_groq(). The model then had to guess a
+# column in sect11_hh_w5.csv (a household-survey file with no
+# national-aggregate livestock figure at all) and picked a nonexistent one
+# ('cs11q06') -> KeyError -> retry -> Groq 429 -> Mistral fallback -> still
+# flagged as a bad/sentinel answer. The correct source for a general
+# livestock question is the livestock survey PDF report, which the keyword
+# router (route_question_keywords, above) already sends "livestock"
+# questions to via strong_pdf — but that keyword list is only consulted
+# when the LLM router call fails; the normal path is the combined
+# rewrite+route LLM call below, which has no equivalent hard override for
+# livestock the way price/inflation and land-utilization already do.
+#
+# Only force "pdf" for GENERAL livestock questions. A genuine
+# household-level computation (e.g. "how many households in Oromia own
+# cattle") legitimately needs the CSV, so don't override those — detect
+# them via _HOUSEHOLD_LEVEL_KEYWORDS and skip the override when present.
+_LIVESTOCK_KEYWORDS_MODULE = (
+    "livestock", "cattle", "oxen", "cows", "cow ", "bulls", "goats", "sheep",
+    "poultry", "chickens", "chicken ", "camels", "beehives", "animal husbandry",
+    "livestock production", "livestock population", "livestock resource",
+)
+
+_HOUSEHOLD_LEVEL_KEYWORDS = (
+    "household", "households", "per household", "families own", "family owns",
+    "how many households", "number of households", "households that own",
+    "households who own", "own livestock", "owning livestock",
+)
 
 
 def _preferred_source_for(question: str) -> str:
@@ -2363,6 +2704,17 @@ Respond with ONLY this JSON, no markdown fences, no commentary:
         log.info(f"Forcing route 'pdf' (was '{route}') for land-utilization question: '{cleaned_question[:50]}'")
         route = "pdf"
 
+    # Livestock override — see _LIVESTOCK_KEYWORDS_MODULE comment above for
+    # the incident this fixes. Skip the override (let csv/hybrid stand) when
+    # the question is actually asking for a household-level computation.
+    if (
+        route in ("csv", "hybrid")
+        and any(k in cleaned_question.lower() for k in _LIVESTOCK_KEYWORDS_MODULE)
+        and not any(k in cleaned_question.lower() for k in _HOUSEHOLD_LEVEL_KEYWORDS)
+    ):
+        log.info(f"Forcing route 'pdf' (was '{route}') for general livestock question: '{cleaned_question[:50]}'")
+        route = "pdf"
+
     if cleaned_question.lower() != question.lower():
         log.info(f"Query rewritten: '{question[:60]}' -> '{cleaned_question[:60]}'")
 
@@ -2479,6 +2831,45 @@ def _fix_dataframe_keys(code: str, dataframes: dict) -> str:
     return re.sub(r"dataframes\[\s*['\"]([^'\"]+)['\"]\s*\]", _repl, code)
 
 
+# Matches dataframes['file.csv']['col_name'] / dataframes["file.csv"]["col_name"]
+# references in generated pandas code, so every column the model claims
+# exists can be checked against the real DataFrame BEFORE eval runs.
+_DF_COL_ACCESS_RE = re.compile(
+    r"dataframes\[\s*['\"]([^'\"]+)['\"]\s*\]\s*\[\s*['\"]([^'\"]+)['\"]\s*\]"
+)
+
+
+def _validate_pandas_columns(code: str, dataframes: dict) -> str:
+    """Catches the 'guessed a column that doesn't exist' failure mode BEFORE
+    burning an eval() + exception + retry cycle on it (confirmed root cause
+    of the livestock/cs11q06 incident in rag_log.txt: the model guessed a
+    nonexistent column, safe_eval_pandas() raised KeyError, and the existing
+    except-block retry consumed a second Groq call that then hit the 429
+    rate limit and fell through to a flagged bad answer).
+
+    Returns a human-readable error string describing the first bad
+    file/column reference found, or None if every dataframes[...][...]
+    reference in the code resolves to a real column. Only checks the
+    bracket-access form the codegen prompt asks for (df['col']) — doesn't
+    attempt to parse dot-attribute access or dynamic column names, so it
+    can't produce false positives on code it doesn't fully understand."""
+    for file_key, col in _DF_COL_ACCESS_RE.findall(code):
+        resolved = None
+        if file_key in dataframes:
+            resolved = file_key
+        elif (file_key + ".csv") in dataframes:
+            resolved = file_key + ".csv"
+
+        if resolved is None:
+            return f"'{file_key}' is not one of the loaded CSV files."
+        if col not in dataframes[resolved].columns:
+            return (
+                f"Column '{col}' does not exist in '{resolved}'. "
+                f"Available columns: {list(dataframes[resolved].columns)}"
+            )
+    return None
+
+
 # CSV PYTHON CODE GENERATION
 # ═══════════════════════════════════════
 def query_csv_with_groq(question: str, dataframes: dict, per_file_schema: dict,
@@ -2579,6 +2970,20 @@ Rules:
     if fixed_code != pandas_code:
         log.info(f"Auto-fixed dataframe keys: {pandas_code} -> {fixed_code}")
         pandas_code = fixed_code
+
+    # Column-existence check BEFORE eval — a guessed/invented column is a
+    # doomed query no matter how many times we retry it against the same
+    # bad guess, so don't spend a retry's Groq call (and rate-limit budget)
+    # on it. Skip straight to returning None so the caller (_gather_sources)
+    # falls through to PDF retrieval immediately, exactly like an "empty
+    # CSV result" already does today.
+    validation_error = _validate_pandas_columns(pandas_code, dataframes)
+    if validation_error:
+        log.warning(
+            f"Skipping pandas execution — invalid column reference in generated code "
+            f"(no retry, falling through to PDF): {validation_error} | code: {pandas_code}"
+        )
+        return None
 
     safe_env = {"dataframes": dataframes, "pd": pd, "len": len, "sum": sum, "round": round, "str": str, "min": min, "max": max, "abs": abs, "int": int, "float": float, "sorted": sorted}
     try:
@@ -2990,7 +3395,7 @@ def get_answer(question: str, chat_history: list = None,
             "page": 0,
             "route": "upload",
             "cached": False,
-            "language": target_lang,
+            "language": _actual_answer_lang(answer, target_lang),
             "resolved_question": None,
         }
 
@@ -3022,7 +3427,7 @@ Question: {question}
 Max 100 words."""
         answer_en = call_groq(prompt, max_tokens=400)
         answer = translate_answer(answer_en, target_lang)
-        result = {"answer": answer, "source": "ESS Asset Index", "page": 0, "route": "meta", "cached": False, "language": target_lang}
+        result = {"answer": answer, "source": "ESS Asset Index", "page": 0, "route": "meta", "cached": False, "language": _actual_answer_lang(answer, target_lang)}
         save_cache(question, answer, result["source"], result["page"], target_lang)
         return result
 
@@ -3137,7 +3542,7 @@ Answer:"""
         "page": best_page,
         "route": effective_route,
         "cached": False,
-        "language": target_lang,
+        "language": _actual_answer_lang(answer, target_lang),
         "resolved_question": question if question != original_question else None,
     }
 
@@ -3168,7 +3573,7 @@ def get_answer_stream(question: str, chat_history: list = None,
             "page": 0,
             "route": "upload",
             "cached": False,
-            "language": target_lang,
+            "language": _actual_answer_lang(full_answer, target_lang),
             "resolved_question": None,
         }
         yield ("done", result)
@@ -3204,7 +3609,7 @@ Max 100 words."""
             yield (kind, out)
             if kind == "done":
                 meta = out
-        result = {"answer": meta["answer"], "source": "ESS Asset Index", "page": 0, "route": "meta", "cached": False, "language": target_lang}
+        result = {"answer": meta["answer"], "source": "ESS Asset Index", "page": 0, "route": "meta", "cached": False, "language": _actual_answer_lang(meta["answer"], target_lang)}
         save_cache(question, meta["answer"], result["source"], result["page"], target_lang)
         yield ("done", result)
         return
@@ -3319,7 +3724,7 @@ Answer:"""
         "page": best_page,
         "route": effective_route,
         "cached": False,
-        "language": target_lang,
+        "language": _actual_answer_lang(full_answer, target_lang),
         "resolved_question": question if question != original_question else None,
     }
     yield ("done", result)
@@ -3391,9 +3796,11 @@ English answer:
     for piece in call_groq_stream(translate_prompt, max_tokens=translate_max_tokens):
         full += piece
         yield ("chunk", piece)
-    if not full.strip():
-        # Translation stream failed — fall back to the English answer rather
-        # than showing nothing.
+    if not full.strip() or not _translation_quality_ok(answer_en, full):
+        # Translation stream failed or produced garbage/echoed-English —
+        # fall back to the English answer rather than showing a broken or
+        # empty result. Already-streamed chunks can't be un-sent, but the
+        # final saved/cached "done" answer will be the trustworthy one.
         full = answer_en
         yield ("chunk", full)
     yield ("done", {"answer": full})

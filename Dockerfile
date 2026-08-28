@@ -1,9 +1,15 @@
 FROM python:3.11-slim
 
-# System deps: psycopg2-binary needs libpq at runtime; pymupdf/chromadb need build tools for some wheels
+# System deps: psycopg2-binary needs libpq at runtime; pymupdf/chromadb need
+# build tools for some wheels; tesseract-ocr + amh pack is required for
+# pdf_extract.py's OCR fallback (check_ocr_available() silently returns
+# False without it — scanned pages just come back empty, no error, no crash).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     build-essential \
+    tesseract-ocr \
+    tesseract-ocr-amh \
+    tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -25,5 +31,6 @@ ENV HF_HUB_OFFLINE=1 \
     PYTHONUNBUFFERED=1
 
 # Shell form (not exec-array form) so $PORT actually gets expanded.
-# Railway assigns PORT dynamically — do not hardcode a port here.
+# Render (like Railway) injects PORT dynamically at runtime — this already
+# reads it correctly; do not hardcode a port here.
 CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-8000} app:app --workers 1 --threads 2 --timeout 120"]

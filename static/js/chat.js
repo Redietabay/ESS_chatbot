@@ -902,8 +902,12 @@ function hasBrowserVoiceFor(localePrefix) {
     if (!('speechSynthesis' in window)) return false;
     const voices = window.speechSynthesis.getVoices();
     // Voice list loads async in some browsers; if it's empty we haven't
-    // heard back yet — assume yes rather than blocking English playback.
-    if (!voices.length) return true;
+    // heard back yet. Only assume "yes" for English, which is near-universal
+    // — for every other locale (am/om especially) an empty list must NOT be
+    // read as "voice available", or a not-yet-loaded voice list silently
+    // lets a wrong-language English voice play for Amharic/Oromo text
+    // (the exact "wrong sound" bug the server-TTS path exists to avoid).
+    if (!voices.length) return localePrefix === 'en';
     return voices.some(v => v.lang && v.lang.toLowerCase().startsWith(localePrefix));
 }
 
@@ -944,13 +948,26 @@ async function speakText(text, answerLang, btnEl) {
         }
     };
 
+    // One quick retry on a connection-level failure before giving up — the
+    // observed failure ("gTTS synthesis failed... Failed to connect") is
+    // frequently transient (shared network hiccup, brief upstream outage),
+    // and retrying is cheap next to silently mislabeling a wrong-language
+    // browser voice as the Amharic answer.
+    const fetchTts = () => fetch(`${TTS_ENDPOINT}?lang=${lang}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: cleanText })
+    });
+
     setBtnLoading(true);
     try {
-        const res = await fetch(`${TTS_ENDPOINT}?lang=${lang}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: cleanText })
-        });
+        let res;
+        try {
+            res = await fetchTts();
+        } catch (networkErr) {
+            await new Promise(r => setTimeout(r, 600));
+            res = await fetchTts();
+        }
 
         if (!res.ok) {
             let detail = null;
@@ -968,11 +985,17 @@ async function speakText(text, answerLang, btnEl) {
         _activeTtsAudio.play();
         _activeTtsAudio.onended = () => URL.revokeObjectURL(url);
     } catch (e) {
-        console.error('Server TTS failed, falling back to browser voice:', e);
-        if ('speechSynthesis' in window) {
+        console.error('Server TTS failed after retry:', e);
+        // Only fall back to the browser voice if one actually exists for
+        // this language — otherwise say so plainly instead of quietly
+        // playing (or failing to play) the wrong language.
+        const browserLocale = LANG_TO_TTS_LOCALE[lang] || 'en-US';
+        if ('speechSynthesis' in window && hasBrowserVoiceFor(browserLocale.split('-')[0])) {
             const utterance = new SpeechSynthesisUtterance(cleanText);
-            utterance.lang = LANG_TO_TTS_LOCALE[lang] || 'en-US';
+            utterance.lang = browserLocale;
             window.speechSynthesis.speak(utterance);
+        } else {
+            showMicStatus('Voice playback is temporarily unavailable. Please try again in a moment.');
         }
     } finally {
         setBtnLoading(false);

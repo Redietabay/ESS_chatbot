@@ -1025,13 +1025,27 @@ async function speakText(text, answerLang, btnEl) {
     }
   };
 
+  // Small helper so a single dropped connection (the observed failure mode —
+  // "Failed to connect" — is very often transient) doesn't immediately fall
+  // back to a wrong-language browser voice or a bare console error. One
+  // quick retry before giving up.
+  const fetchTts = () => fetch(`${TTS_ENDPOINT}?lang=${lang}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: cleanText })
+  });
+
   setBtnLoading(true);
   try {
-    const res = await fetch(`${TTS_ENDPOINT}?lang=${lang}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: cleanText })
-    });
+    let res;
+    try {
+      res = await fetchTts();
+    } catch (networkErr) {
+      // Connection-level failure (DNS/refused/etc, not an HTTP error status)
+      // — retry once after a short pause before giving up on the server.
+      await new Promise(r => setTimeout(r, 600));
+      res = await fetchTts();
+    }
 
     if (!res.ok) {
       let detail = null;
@@ -1049,11 +1063,19 @@ async function speakText(text, answerLang, btnEl) {
     _activeTtsAudio.play();
     _activeTtsAudio.onended = () => URL.revokeObjectURL(url);
   } catch (e) {
-    console.error('Server TTS failed, falling back to browser voice:', e);
-    if ('speechSynthesis' in window) {
+    console.error('Server TTS failed after retry:', e);
+    // Only fall back to the browser's built-in voice if one is actually
+    // installed for this language — for am/om that's almost never true, and
+    // silently substituting an English voice for Amharic text is the
+    // "wrong sound" bug this whole server-TTS path exists to avoid. When no
+    // matching voice exists, tell the person plainly instead of guessing.
+    const browserLocale = LANG_TO_TTS_LOCALE[lang] || 'en-US';
+    if ('speechSynthesis' in window && hasBrowserVoiceFor(browserLocale.split('-')[0])) {
       const utterance = new SpeechSynthesisUtterance(cleanText);
-      utterance.lang = LANG_TO_TTS_LOCALE[lang] || 'en-US';
+      utterance.lang = browserLocale;
       window.speechSynthesis.speak(utterance);
+    } else {
+      showMicStatus('Voice playback is temporarily unavailable. Please try again in a moment.');
     }
   } finally {
     setBtnLoading(false);

@@ -17,6 +17,3 @@ gunicorn
 deep-translator==1.11.4
 gTTS
 ftfy
-
-# .\venv\Scripts\Activate.ps1    activate virtual enviromnt
-
