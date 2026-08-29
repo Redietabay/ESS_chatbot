@@ -9,34 +9,35 @@
  *
  * That's the entire integration. This script injects a floating chat
  * bubble in the bottom-right corner; clicking it opens/closes an iframe
- * pointing to /widget on your chatbot's own domain. Because the chat UI
- * itself lives in that iframe (same-origin with your Flask app), no CORS
- * configuration or cross-site cookie setup is needed on either side.
+ * pointing to /widget on your chatbot's own domain.
  *
- * On phone-width screens the iframe becomes a full-screen sheet instead
- * of a small anchored box — a fixed small box is what traps the input
- * bar under the on-screen keyboard; a full sheet has room to reflow.
+ * CHATBOT_URL resolution order:
+ *   1. data-chatbot-url attribute, if set to an absolute http(s) URL.
+ *      Use this ONLY when embedding on a DIFFERENT domain than the
+ *      chatbot itself (e.g. the real statsethiopia.gov.et site pointing
+ *      at your Flask backend).
+ *   2. window.location.origin — the origin of the page that's currently
+ *      running this script. Correct by default whenever this script is
+ *      loaded from the SAME app that serves /widget (local testing via
+ *      /test, or ngrok — the browser is always on that one origin, so
+ *      this is always right and needs no extra logic).
  *
- * If data-chatbot-url is omitted, the script falls back to the domain it
- * was itself loaded from (works if the <script> tag's src already points
- * at your chatbot's domain).
+ * We deliberately do NOT derive the origin from the <script> tag's own
+ * src (via document.currentScript) anymore — that approach broke when
+ * testing through ngrok (it resolved to localhost:5000 in practice,
+ * probably due to caching/duplicate static files), causing the CSP
+ * frame-ancestors error. window.location.origin has no such failure mode.
  */
 (function () {
-  // Guards against the script tag being included twice on the same page
-  // (accidental duplicate <script> tag, or injected again by a CMS/tag
-  // manager) — without this, a second run appended a second bubble + a
-  // second iframe, both listening for clicks/messages independently.
   if (document.getElementById('ess-widget-bubble')) return;
 
   var CURRENT_SCRIPT = document.currentScript;
-  var CHATBOT_URL = (CURRENT_SCRIPT && CURRENT_SCRIPT.getAttribute('data-chatbot-url'))
-    || (CURRENT_SCRIPT && new URL(CURRENT_SCRIPT.src).origin)
-    || '';
+  var explicitUrl = CURRENT_SCRIPT && CURRENT_SCRIPT.getAttribute('data-chatbot-url');
+  var CHATBOT_URL = (explicitUrl && /^https?:\/\//i.test(explicitUrl))
+    ? explicitUrl
+    : window.location.origin;
 
-  if (!CHATBOT_URL) {
-    console.error('[ESS widget] Could not determine chatbot URL — set data-chatbot-url on the <script> tag.');
-    return;
-  }
+  console.log('[ESS widget] CHATBOT_URL resolved to:', CHATBOT_URL);
 
   var isOpen = false;
 
@@ -77,14 +78,10 @@
   function openWidget() {
     isOpen = true;
     frameWrap.style.display = 'flex';
-    // Small delay so the CSS transition (opacity/transform) actually runs
-    // instead of jumping straight to the open state.
     requestAnimationFrame(function () {
       frameWrap.classList.add('ess-widget-open');
     });
     bubble.innerHTML = closeIconSVG();
-    // Lock host-page scroll while the full-screen sheet is open on mobile —
-    // otherwise the background page can scroll behind it as the keyboard opens.
     if (window.matchMedia('(max-width: 640px)').matches) {
       document.body.style.overflow = 'hidden';
     }
@@ -97,7 +94,7 @@
     document.body.style.overflow = '';
     setTimeout(function () {
       if (!isOpen) frameWrap.style.display = 'none';
-    }, 200); // matches the CSS transition duration below
+    }, 200);
   }
 
   function bubbleIconSVG() {
@@ -138,9 +135,6 @@
       '}',
       '#ess-widget-frame-wrap.ess-widget-open{ opacity:1; transform:translateY(0); }',
       '#ess-widget-iframe{ width:100%; height:100%; border:none; display:block; }',
-      /* Phone-width screens: full-screen sheet instead of a small anchored
-         box, so the chat UI has room to shrink around the on-screen keyboard
-         rather than being crushed inside a fixed-size box. */
       '@media (max-width: 640px){',
       '  #ess-widget-frame-wrap{',
       '    inset:0; bottom:0; right:0; top:0; left:0;',
