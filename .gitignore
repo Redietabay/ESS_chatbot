@@ -7,3 +7,4 @@ __pycache__/
 *_log.txt 
 "@ | Out-File -Encoding utf8 .gitignore 
 data/
+tts_cache/

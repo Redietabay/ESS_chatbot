@@ -48,7 +48,8 @@ const UI_STRINGS = {
     cancel: 'Cancel',
     freeQuestionsUsed: 'Free questions used.',
     createFreeAccount: 'Create a free account',
-    or: 'or'
+    or: 'or',
+    guestModeUnlimited: "You're chatting as a guest — answers won't be saved."
   },
   am: {
     welcome: '👋 ሰላም! ስለ ኢትዮጵያ የህዝብ ቆጠራ፣ የኢኮኖሚ ጥናቶች፣ የከብት እርባታ መረጃ ወይም የዋጋ ግሽበት ይጠይቁኝ።',
@@ -83,7 +84,8 @@ const UI_STRINGS = {
     cancel: 'ይቅር',
     freeQuestionsUsed: 'ነጻ ጥያቄዎች አልቀዋል።',
     createFreeAccount: 'ነጻ መለያ ይፍጠሩ',
-    or: 'ወይም'
+    or: 'ወይም',
+    guestModeUnlimited: 'እንደ እንግዳ እየተወያዩ ነው — መልሶች አይቀመጡም።'
   }
 };
 let uiLang = 'en';
@@ -406,7 +408,7 @@ async function loadGuestStatus() {
   try {
     const res = await fetch('/guest_status');
     const data = await res.json();
-    if (data.is_guest && typeof data.remaining === 'number') {
+    if (data.is_guest) {
       // The server no longer recognizes this browser as logged in (expired
       // cookie, or the cross-site cookie never made it through) — drop any
       // stale saved session id instead of sending it as an "owned" session
@@ -608,7 +610,9 @@ async function submitAuth(mode) {
 function updateGuestBanner(remaining) {
   hideAuthPanel();
   const t = UI_STRINGS[uiLang];
-  if (remaining <= 0) {
+  if (remaining === null || remaining === undefined) {
+    wGuestBanner.innerHTML = `${t.guestModeUnlimited} <button type="button" class="w-banner-link" id="wSignInBtn">${t.signIn}</button> ${t.or} <button type="button" class="w-banner-link" id="wRegisterBtn">${t.createFreeAccount}</button>`;
+  } else if (remaining <= 0) {
     wGuestBanner.innerHTML = `${t.freeQuestionsUsed} <button type="button" class="w-banner-link" id="wRegisterBtn">${t.createFreeAccount}</button> ${t.or} <button type="button" class="w-banner-link" id="wSignInBtn">${t.signIn}</button>`;
   } else {
     wGuestBanner.innerHTML = `${remaining} ${remaining === 1 ? t.freeQuestionsLeft : t.freeQuestionsLeftPlural} ${t.left} · <button type="button" class="w-banner-link" id="wSignInBtn">${t.signIn}</button>`;
@@ -899,7 +903,7 @@ async function handleSend() {
               appendTimingTag(bubble, meta.elapsed);
             }
             if (meta.language) bubble.dataset.answerLang = meta.language; // en | am | om
-            if (typeof meta.guest_remaining === 'number') {
+            if (!wIsLoggedIn && meta.guest_remaining !== undefined) {
               updateGuestBanner(meta.guest_remaining);
             }
           } catch (e) {
@@ -1095,7 +1099,6 @@ function injectLangSelector() {
     <select id="wLangSelector" class="w-lang-select" title="Mic language">
       <option value="en-US">EN</option>
       <option value="am-ET" selected>አማ</option>
-      <option value="om-ET">OM</option>
     </select>
   `;
   inputArea.parentNode.insertBefore(wrap, inputArea);
@@ -1132,7 +1135,10 @@ function initSpeechRecognition() {
   }
 
   recognition = new SpeechRecognition();
-  recognition.continuous = false;
+  // continuous=true: keep listening until the user clicks the mic button
+  // again, instead of the browser auto-stopping after a short pause of
+  // silence. Start/stop is fully user-controlled via toggleMic().
+  recognition.continuous = true;
   recognition.lang = currentLanguage;
   recognition.interimResults = false;
 
@@ -1144,8 +1150,6 @@ function initSpeechRecognition() {
     showMicStatus('');
   };
 
-  recognition.onspeechend = () => recognition.stop();
-
   recognition.onend = () => {
     isListening = false;
     const micBtn = document.getElementById('wMicBtn');
@@ -1153,10 +1157,18 @@ function initSpeechRecognition() {
     wInput.placeholder = UI_STRINGS[uiLang].placeholder;
   };
 
+  // Just fill the input box — never auto-send. The user reviews the
+  // transcribed text and sends it themselves (Send button or Enter).
+  // With continuous=true, results accumulate across the whole session,
+  // so we re-join every recognized chunk each time instead of only
+  // keeping the first one.
   recognition.onresult = (event) => {
-    wInput.value = event.results[0][0].transcript;
+    let transcript = '';
+    for (let i = 0; i < event.results.length; i++) {
+      transcript += event.results[i][0].transcript;
+    }
+    wInput.value = transcript;
     wInput.focus();
-    setTimeout(() => handleSend(), 500);
   };
 
   // Mobile browsers hit these far more than desktop (permission prompts,

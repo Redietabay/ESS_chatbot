@@ -28,7 +28,7 @@ from tts_route import tts_bp
 
 STREAM_META_SEP = "\x00__ESS_META__\x00"
 MAX_QUESTION_LENGTH = 1000  # chars — generous for real questions, blocks megabyte-scale abuse
-GUEST_QUESTION_LIMIT = int(os.getenv("GUEST_QUESTION_LIMIT", "5"))  # per-browser-session cap for guests
+GUEST_QUESTION_LIMIT = int(os.getenv("GUEST_QUESTION_LIMIT", "0"))  # per-browser-session cap for guests; 0 (default) = unlimited
 
 # ── Uploaded-document config ──
 UPLOAD_MAX_BYTES = 15 * 1024 * 1024   # 15 MB
@@ -214,7 +214,14 @@ def current_username():
 def guest_questions_used() -> int:
     return session.get("guest_qcount", 0)
 
-def guest_questions_remaining() -> int:
+def guest_questions_remaining():
+    """Returns None when guests are unlimited (GUEST_QUESTION_LIMIT <= 0) —
+    every caller (the /ask, /ask_stream limit checks, /guest_status, and the
+    chat.js/widget.js banners which explicitly check `typeof x === 'number'`
+    before showing anything) already treats None as "no limit, don't show
+    a counter", so this one change turns the whole quota UI off cleanly."""
+    if GUEST_QUESTION_LIMIT <= 0:
+        return None
     return max(0, GUEST_QUESTION_LIMIT - guest_questions_used())
 
 def register_guest_question():
@@ -719,7 +726,8 @@ def ask():
         # Guests have no saved sessions — never persist/own one.
         session_id = None
         _get_or_create_guest_token()
-        if guest_questions_remaining() <= 0:
+        remaining = guest_questions_remaining()
+        if remaining is not None and remaining <= 0:
             return jsonify({
                 "error": f"You've used your {GUEST_QUESTION_LIMIT} free guest questions. Please sign in or create a free account to keep asking.",
                 "code": "guest_limit_reached"
@@ -816,7 +824,8 @@ def ask_stream():
         # Guests have no saved sessions — never persist/own one.
         session_id = None
         _get_or_create_guest_token()
-        if guest_questions_remaining() <= 0:
+        remaining = guest_questions_remaining()
+        if remaining is not None and remaining <= 0:
             return jsonify({
                 "error": f"You've used your {GUEST_QUESTION_LIMIT} free guest questions. Please sign in or create a free account to keep asking.",
                 "code": "guest_limit_reached"

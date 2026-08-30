@@ -193,6 +193,14 @@ body {
     padding: 24px 12px;
 }
 
+.empty-sessions a {
+    color: #4fc3f7;
+    text-decoration: underline;
+}
+.empty-sessions a:hover {
+    color: #29b6f6;
+}
+
 /* ═══════════════════════════════════════
    MAIN CHAT PLATFORM CONTAINER
    ═══════════════════════════════════════ */
@@ -855,34 +863,77 @@ body {
     scrollbar-color: #1e4d8c transparent;
 }
 
+/* ── Mobile sidebar toggle (hamburger) — hidden on desktop, shown <=720px ── */
+.sidebar-toggle-btn {
+    display: none;
+    background: none;
+    border: none;
+    color: #e0e0e0;
+    padding: 4px 8px;
+    margin-right: 8px;
+    cursor: pointer;
+    border-radius: 6px;
+    flex-shrink: 0;
+}
+.sidebar-toggle-btn:hover { background: rgba(255,255,255,0.08); }
+.sidebar-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.5);
+    z-index: 999;
+}
+
 /* ═══════════════════════════════════════
    RESPONSIVE MEDIA QUERIES
    ═══════════════════════════════════════ */
 @media (max-width: 720px) {
-    body { 
-        flex-direction: column; 
+    body {
+        flex-direction: column;
     }
+    .sidebar-toggle-btn { display: inline-flex; align-items: center; justify-content: center; }
+    /* Off-canvas drawer instead of stacking above the chat — the old
+       max-height:40vh approach pushed the actual chat below the fold on
+       first load, since the session list ate ~40% of the screen before
+       a single message was visible. Now the sidebar slides in over the
+       chat only when the hamburger is tapped. */
     .sidebar {
-        width: 100%;
-        height: auto;
-        max-height: 40vh;
-        overflow-y: auto;
-        border-right: none;
-        border-bottom: 1px solid #1e4d8c;
+        position: fixed;
+        top: 0;
+        left: 0;
+        bottom: 0;
+        width: 82vw;
+        max-width: 320px;
+        height: 100vh;
+        height: 100dvh;
+        max-height: none;
+        z-index: 1000;
+        transform: translateX(-100%);
+        transition: transform 0.22s ease;
+        border-right: 1px solid #1e4d8c;
+        border-bottom: none;
+    }
+    .sidebar.mobile-open {
+        transform: translateX(0);
+    }
+    .sidebar-overlay.visible {
+        display: block;
     }
     .chat-container {
-        min-height: 60vh;
+        min-height: 100vh;
+        min-height: 100dvh;
         flex: 1;
         overflow: hidden;
     }
-    .msg { 
-        max-width: 90%; 
+    .msg {
+        max-width: 90%;
     }
-    .input-area { 
-        padding: 12px; 
+    .input-area {
+        padding: 12px;
+        padding-bottom: calc(12px + env(safe-area-inset-bottom));
     }
-    .suggestions-grid { 
-        grid-template-columns: 1fr; 
+    .suggestions-grid {
+        grid-template-columns: 1fr;
     }
     .chat-header h2 {
         font-size: 1rem;

@@ -124,7 +124,37 @@ document.addEventListener('DOMContentLoaded', () => {
     injectFileUpload(); // Inject the 📎 attach-document button + chip
     restoreUploadedFileChip(); // Show the chip again if a doc survived a page reload
     if (window.IS_GUEST) initGuestBanner();
+    initMobileSidebar();
 });
+
+// ═══════════════════════════════════════
+// MOBILE SIDEBAR (off-canvas drawer, <=720px — desktop is unaffected,
+// .sidebar-toggle-btn is display:none there so this never fires)
+// ═══════════════════════════════════════
+function initMobileSidebar() {
+    const toggleBtn = document.getElementById('sidebarToggleBtn');
+    const sidebar = document.querySelector('.sidebar');
+    const overlay = document.getElementById('sidebarOverlay');
+    if (!toggleBtn || !sidebar || !overlay) return;
+
+    const closeSidebar = () => {
+        sidebar.classList.remove('mobile-open');
+        overlay.classList.remove('visible');
+    };
+    const openSidebar = () => {
+        sidebar.classList.add('mobile-open');
+        overlay.classList.add('visible');
+    };
+
+    toggleBtn.addEventListener('click', () => {
+        sidebar.classList.contains('mobile-open') ? closeSidebar() : openSidebar();
+    });
+    overlay.addEventListener('click', closeSidebar);
+    // Picking a session or starting a new chat should close the drawer so
+    // the user actually sees the chat they just switched to.
+    sessionsList.addEventListener('click', closeSidebar);
+    newChatBtn.addEventListener('click', closeSidebar);
+}
 
 // ═══════════════════════════════════════
 // FILE UPLOAD — attach a PDF and ask questions about it directly
@@ -1020,7 +1050,6 @@ function injectLanguageSelector() {
         <select id="langSelector" style="background: #0f3460; border: 1px solid #1e4d8c; color: white; border-radius: 4px; padding: 2px 6px; cursor: pointer;">
             <option value="en-US">English (US)</option>
             <option value="am-ET" selected>Amharic (አማርኛ)</option>
-            <option value="om-ET">Afaan Oromoo</option>
         </select>
     `;
 
@@ -1062,7 +1091,10 @@ function initSpeechRecognition() {
     }
 
     recognition = new SpeechRecognition();
-    recognition.continuous = false;
+    // continuous=true: keep listening until the user clicks the mic button
+    // again, instead of the browser auto-stopping after a short pause of
+    // silence. Start/stop is fully user-controlled via toggleMic().
+    recognition.continuous = true;
     recognition.lang = currentLanguage;
     recognition.interimResults = false;
 
@@ -1077,10 +1109,6 @@ function initSpeechRecognition() {
         showMicStatus('');
     };
 
-    recognition.onspeechend = () => {
-        recognition.stop();
-    };
-
     recognition.onend = () => {
         isListening = false;
         const micBtn = document.getElementById('micBtn');
@@ -1091,14 +1119,18 @@ function initSpeechRecognition() {
         questionInput.placeholder = UI_STRINGS[uiLang].placeholder;
     };
 
+    // Just fill the input box — never auto-send. The user reviews the
+    // transcribed text and sends it themselves (Send button or Enter).
+    // With continuous=true, results accumulate across the whole session,
+    // so we re-join every recognized chunk each time instead of only
+    // keeping the first one.
     recognition.onresult = (event) => {
-        const speechToTextResult = event.results[0][0].transcript;
-        questionInput.value = speechToTextResult;
+        let transcript = '';
+        for (let i = 0; i < event.results.length; i++) {
+            transcript += event.results[i][0].transcript;
+        }
+        questionInput.value = transcript;
         questionInput.focus();
-
-        setTimeout(() => {
-            handleSend();
-        }, 500);
     };
 
     // Mobile browsers hit these far more than desktop (permission prompts,

@@ -58,6 +58,9 @@
 
     <div class="chat-container">
         <div class="chat-header">
+            <button id="sidebarToggleBtn" class="sidebar-toggle-btn" type="button" aria-label="Toggle chat list" title="Chats">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+            </button>
             <h2 id="chatTitle">New Chat</h2>
             <div class="lang-toggle" id="uiLangToggle">
                 <button type="button" data-lang="en" class="active">EN</button>
@@ -66,7 +69,7 @@
         </div>
 
         {% if is_guest %}
-        <div id="guestBanner" class="guest-banner">Guest mode: 5 free questions left (unsaved).</div>
+        <div id="guestBanner" class="guest-banner">Guest mode — chat won't be saved. <a href="/login">Sign in</a> or <a href="/register">create an account</a> to keep your chat history.</div>
         {% endif %}
 
         <div class="messages-area" id="messagesArea">
@@ -93,6 +96,8 @@
             </div>
         </div>
     </div>
+
+    <div id="sidebarOverlay" class="sidebar-overlay"></div>
 
     <script>window.IS_GUEST = {{ 'true' if is_guest else 'false' }};</script>
     <script src="{{ url_for('static', filename='js/chat.js') }}"></script>

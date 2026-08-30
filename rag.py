@@ -82,6 +82,17 @@ if FAST_MODEL.strip() in _GROQ_KNOWN_DECOMMISSIONED:
     log.warning(f"GROQ_FAST_MODEL env var is set to the decommissioned '{FAST_MODEL.strip()}' — "
                 f"overriding to 'openai/gpt-oss-20b'. Fix/remove GROQ_FAST_MODEL in your .env file.")
     FAST_MODEL = "openai/gpt-oss-20b"
+# Sampling temperature used ONLY for the final user-facing answer text
+# (get_answer/get_answer_stream). Everything else — query rewriting, routing,
+# pandas code generation, translation — stays at temperature 0.0 by default
+# (call_groq/call_groq_stream default to 0.0 when this isn't passed), since
+# those need deterministic, exact output. A small positive value here just
+# varies phrasing/wording call-to-call; it does NOT change which facts/
+# numbers get retrieved (that's still RAG retrieval, untouched by this) or
+# let the model invent figures — it only affects how the same retrieved
+# facts get worded. Keep this low (0.1-0.3); 0.0 reads robotic/repetitive,
+# anything much above ~0.4 risks looser wording of exact figures.
+ANSWER_TEMPERATURE = float(os.getenv("ANSWER_TEMPERATURE", "0.2"))
 # Wall-clock cap per Groq API call so a stalled connection can't hang a worker
 # indefinitely (e.g. mid-stream network drop). Applies to both the normal and
 # streaming call paths below.
@@ -181,7 +192,7 @@ OLLAMA_ENABLED  = os.getenv("OLLAMA_ENABLED", "true").lower() == "true"
 OLLAMA_TIMEOUT  = float(os.getenv("OLLAMA_TIMEOUT", "60"))
 
 
-def _call_ollama(prompt: str, max_tokens: int = 500) -> str:
+def _call_ollama(prompt: str, max_tokens: int = 500, temperature: float = 0.0) -> str:
     """Non-streaming local fallback. Returns '' on any failure (model not
     pulled, Ollama not running, timeout) so callers can detect total failure
     and fall through to GROQ_UNAVAILABLE_MSG same as before."""
@@ -194,7 +205,7 @@ def _call_ollama(prompt: str, max_tokens: int = 500) -> str:
                 "model": OLLAMA_MODEL,
                 "prompt": prompt,
                 "stream": False,
-                "options": {"num_predict": max_tokens, "temperature": 0.0},
+                "options": {"num_predict": max_tokens, "temperature": temperature},
             },
             timeout=OLLAMA_TIMEOUT,
         )
@@ -209,7 +220,7 @@ def _call_ollama(prompt: str, max_tokens: int = 500) -> str:
         return ""
 
 
-def _call_ollama_stream(prompt: str, max_tokens: int = 500):
+def _call_ollama_stream(prompt: str, max_tokens: int = 500, temperature: float = 0.0):
     """Streaming local fallback. Yields text chunks as they arrive; yields
     nothing at all on failure, so the caller's `yielded_any` check correctly
     falls through to GROQ_UNAVAILABLE_MSG."""
@@ -222,7 +233,7 @@ def _call_ollama_stream(prompt: str, max_tokens: int = 500):
                 "model": OLLAMA_MODEL,
                 "prompt": prompt,
                 "stream": True,
-                "options": {"num_predict": max_tokens, "temperature": 0.0},
+                "options": {"num_predict": max_tokens, "temperature": temperature},
             },
             timeout=OLLAMA_TIMEOUT,
             stream=True,
@@ -285,7 +296,7 @@ GEMINI_GENERATION_CONFIG_EXTRA = {"thinkingConfig": {"thinkingBudget": 0}}
 
 
 
-def _call_gemini(prompt: str, max_tokens: int = 500) -> str:
+def _call_gemini(prompt: str, max_tokens: int = 500, temperature: float = 0.0) -> str:
     """Non-streaming Gemini fallback. Returns '' on any failure (no key,
     rate-limited, network error) so callers fall through to Ollama exactly
     like a disabled/failed Ollama call already does."""
@@ -297,7 +308,7 @@ def _call_gemini(prompt: str, max_tokens: int = 500) -> str:
             params={"key": GEMINI_API_KEY},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.0, **GEMINI_GENERATION_CONFIG_EXTRA},
+                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": temperature, **GEMINI_GENERATION_CONFIG_EXTRA},
             },
             timeout=GEMINI_TIMEOUT,
         )
@@ -318,7 +329,7 @@ def _call_gemini(prompt: str, max_tokens: int = 500) -> str:
         return ""
 
 
-def _call_gemini_stream(prompt: str, max_tokens: int = 500):
+def _call_gemini_stream(prompt: str, max_tokens: int = 500, temperature: float = 0.0):
     """Streaming Gemini fallback via SSE. Yields text chunks as they arrive;
     yields nothing at all on failure, so the caller's `yielded_any` check
     correctly falls through to Ollama, same pattern as _call_ollama_stream."""
@@ -330,7 +341,7 @@ def _call_gemini_stream(prompt: str, max_tokens: int = 500):
             params={"key": GEMINI_API_KEY, "alt": "sse"},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.0, **GEMINI_GENERATION_CONFIG_EXTRA},
+                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": temperature, **GEMINI_GENERATION_CONFIG_EXTRA},
             },
             timeout=GEMINI_TIMEOUT,
             stream=True,
@@ -385,7 +396,7 @@ OPENROUTER_TIMEOUT  = float(os.getenv("OPENROUTER_TIMEOUT", "15"))
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
-def _call_openrouter(prompt: str, max_tokens: int = 500) -> str:
+def _call_openrouter(prompt: str, max_tokens: int = 500, temperature: float = 0.0) -> str:
     """Non-streaming OpenRouter fallback. Returns '' on any failure (no key,
     disabled, rate-limited, network error)."""
     if not OPENROUTER_ENABLED or not _fallback_available("openrouter"):
@@ -398,7 +409,7 @@ def _call_openrouter(prompt: str, max_tokens: int = 500) -> str:
                 "model": OPENROUTER_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": max_tokens,
-                "temperature": 0.0,
+                "temperature": temperature,
             },
             timeout=OPENROUTER_TIMEOUT,
         )
@@ -418,7 +429,7 @@ def _call_openrouter(prompt: str, max_tokens: int = 500) -> str:
         return ""
 
 
-def _call_openrouter_stream(prompt: str, max_tokens: int = 500):
+def _call_openrouter_stream(prompt: str, max_tokens: int = 500, temperature: float = 0.0):
     """Streaming OpenRouter fallback (OpenAI-compatible SSE). Yields nothing
     at all on failure, matching the other streaming fallbacks."""
     if not OPENROUTER_ENABLED or not _fallback_available("openrouter"):
@@ -431,7 +442,7 @@ def _call_openrouter_stream(prompt: str, max_tokens: int = 500):
                 "model": OPENROUTER_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": max_tokens,
-                "temperature": 0.0,
+                "temperature": temperature,
                 "stream": True,
             },
             timeout=OPENROUTER_TIMEOUT,
@@ -480,7 +491,7 @@ MISTRAL_TIMEOUT  = float(os.getenv("MISTRAL_TIMEOUT", "15"))
 MISTRAL_BASE_URL = "https://api.mistral.ai/v1/chat/completions"
 
 
-def _call_mistral(prompt: str, max_tokens: int = 500) -> str:
+def _call_mistral(prompt: str, max_tokens: int = 500, temperature: float = 0.0) -> str:
     """Non-streaming Mistral fallback. Returns '' on any failure."""
     if not MISTRAL_ENABLED or not _fallback_available("mistral"):
         return ""
@@ -492,7 +503,7 @@ def _call_mistral(prompt: str, max_tokens: int = 500) -> str:
                 "model": MISTRAL_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": max_tokens,
-                "temperature": 0.0,
+                "temperature": temperature,
             },
             timeout=MISTRAL_TIMEOUT,
         )
@@ -512,7 +523,7 @@ def _call_mistral(prompt: str, max_tokens: int = 500) -> str:
         return ""
 
 
-def _call_mistral_stream(prompt: str, max_tokens: int = 500):
+def _call_mistral_stream(prompt: str, max_tokens: int = 500, temperature: float = 0.0):
     """Streaming Mistral fallback (OpenAI-compatible SSE)."""
     if not MISTRAL_ENABLED or not _fallback_available("mistral"):
         return
@@ -524,7 +535,7 @@ def _call_mistral_stream(prompt: str, max_tokens: int = 500):
                 "model": MISTRAL_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": max_tokens,
-                "temperature": 0.0,
+                "temperature": temperature,
                 "stream": True,
             },
             timeout=MISTRAL_TIMEOUT,
@@ -563,7 +574,7 @@ CEREBRAS_TIMEOUT  = float(os.getenv("CEREBRAS_TIMEOUT", "15"))
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1/chat/completions"
 
 
-def _call_cerebras(prompt: str, max_tokens: int = 500) -> str:
+def _call_cerebras(prompt: str, max_tokens: int = 500, temperature: float = 0.0) -> str:
     """Non-streaming Cerebras fallback. Returns '' on any failure."""
     if not CEREBRAS_ENABLED or not _fallback_available("cerebras"):
         return ""
@@ -575,7 +586,7 @@ def _call_cerebras(prompt: str, max_tokens: int = 500) -> str:
                 "model": CEREBRAS_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": max_tokens,
-                "temperature": 0.0,
+                "temperature": temperature,
             },
             timeout=CEREBRAS_TIMEOUT,
         )
@@ -595,7 +606,7 @@ def _call_cerebras(prompt: str, max_tokens: int = 500) -> str:
         return ""
 
 
-def _call_cerebras_stream(prompt: str, max_tokens: int = 500):
+def _call_cerebras_stream(prompt: str, max_tokens: int = 500, temperature: float = 0.0):
     """Streaming Cerebras fallback (OpenAI-compatible SSE)."""
     if not CEREBRAS_ENABLED or not _fallback_available("cerebras"):
         return
@@ -607,7 +618,7 @@ def _call_cerebras_stream(prompt: str, max_tokens: int = 500):
                 "model": CEREBRAS_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": max_tokens,
-                "temperature": 0.0,
+                "temperature": temperature,
                 "stream": True,
             },
             timeout=CEREBRAS_TIMEOUT,
@@ -690,19 +701,19 @@ _FALLBACK_ORDER = _build_fallback_order()
 log.info(f"Fallback chain order (after Groq): {' -> '.join(_FALLBACK_ORDER)}")
 
 
-def _call_fallback_chain(prompt: str, max_tokens: int = 500) -> str:
+def _call_fallback_chain(prompt: str, max_tokens: int = 500, temperature: float = 0.0) -> str:
     """Tries each fallback tier in FALLBACK_ORDER, returns the first
     non-empty answer. Returns '' only if every tier is
     disabled/unreachable/empty."""
     for name in _FALLBACK_ORDER:
         fn = _call_ollama if name == "ollama" else _FALLBACK_TIERS[name][1]
-        text = fn(prompt, max_tokens=max_tokens)
+        text = fn(prompt, max_tokens=max_tokens, temperature=temperature)
         if text:
             return text
     return ""
 
 
-def _call_fallback_chain_stream(prompt: str, max_tokens: int = 500):
+def _call_fallback_chain_stream(prompt: str, max_tokens: int = 500, temperature: float = 0.0):
     """Tries each fallback tier's streaming variant in FALLBACK_ORDER,
     yielding from the first one that produces a real answer, then stopping.
 
@@ -724,7 +735,7 @@ def _call_fallback_chain_stream(prompt: str, max_tokens: int = 500):
         display_name, fn = ("Ollama", _call_ollama_stream) if name == "ollama" else _FALLBACK_TIERS[name][::2]
         buffer = ""
         flushed = False
-        for piece in fn(prompt, max_tokens=max_tokens):
+        for piece in fn(prompt, max_tokens=max_tokens, temperature=temperature):
             if flushed:
                 yield piece
                 continue
@@ -1411,12 +1422,12 @@ def save_cache(question: str, answer: str, source: str, page: int, language: str
 # "...Please try again in 8.0s." or "...Please try again in 370ms."
 _RETRY_AFTER_RE = re.compile(r"try again in\s+([\d.]+)\s*(ms|s)\b", re.IGNORECASE)
 
-def call_groq(prompt: str, retries: int = 2, max_tokens: int = 500, model: str = None) -> str:
+def call_groq(prompt: str, retries: int = 2, max_tokens: int = 500, model: str = None, temperature: float = 0.0) -> str:
     use_model = model or MODEL
 
     if _token_budget.should_refuse():
         log.warning(f"Daily token budget exhausted ({_token_budget.ratio():.0%}) — skipping Groq, trying fallback chain.")
-        return _call_fallback_chain(prompt, max_tokens=max_tokens) or BUDGET_EXHAUSTED_MSG
+        return _call_fallback_chain(prompt, max_tokens=max_tokens, temperature=temperature) or BUDGET_EXHAUSTED_MSG
     if _token_budget.should_downgrade() and use_model != FAST_MODEL:
         log.info(f"Token budget at {_token_budget.ratio():.0%} — proactively using {FAST_MODEL} instead of {use_model}.")
         use_model = FAST_MODEL
@@ -1436,7 +1447,7 @@ def call_groq(prompt: str, retries: int = 2, max_tokens: int = 500, model: str =
                 log.warning(f"Model '{use_model}' still cooling down ({cooldown:.1f}s left) — skipping call.")
                 if attempt < retries - 1:
                     continue
-                return _call_fallback_chain(prompt, max_tokens=max_tokens) or GROQ_UNAVAILABLE_MSG
+                return _call_fallback_chain(prompt, max_tokens=max_tokens, temperature=temperature) or GROQ_UNAVAILABLE_MSG
 
         _throttle_for(use_model).wait_if_needed()
         try:
@@ -1444,7 +1455,7 @@ def call_groq(prompt: str, retries: int = 2, max_tokens: int = 500, model: str =
                 model             = use_model,
                 messages          = [{"role": "user", "content": prompt}],
                 max_tokens        = max_tokens,
-                temperature       = 0.0,
+                temperature       = temperature,
                 timeout           = GROQ_REQUEST_TIMEOUT,
                 reasoning_effort  = "low",
                 include_reasoning = False,
@@ -1497,15 +1508,15 @@ def call_groq(prompt: str, retries: int = 2, max_tokens: int = 500, model: str =
     # All Groq retries exhausted (rate-limited on every model, or erroring) —
     # walk the rest of the fallback chain (Gemini -> OpenRouter -> Cerebras
     # -> Ollama) before giving up entirely.
-    return _call_fallback_chain(prompt, max_tokens=max_tokens) or GROQ_UNAVAILABLE_MSG
+    return _call_fallback_chain(prompt, max_tokens=max_tokens, temperature=temperature) or GROQ_UNAVAILABLE_MSG
 
-def call_groq_stream(prompt: str, max_tokens: int = 500, model: str = None):
+def call_groq_stream(prompt: str, max_tokens: int = 500, model: str = None, temperature: float = 0.0):
     use_model = model or MODEL
 
     if _token_budget.should_refuse():
         log.warning(f"Daily token budget exhausted ({_token_budget.ratio():.0%}) — skipping Groq stream, trying fallback chain.")
         yielded_any = False
-        for piece in _call_fallback_chain_stream(prompt, max_tokens=max_tokens):
+        for piece in _call_fallback_chain_stream(prompt, max_tokens=max_tokens, temperature=temperature):
             yielded_any = True
             yield piece
         if not yielded_any:
@@ -1549,7 +1560,7 @@ def call_groq_stream(prompt: str, max_tokens: int = 500, model: str = None):
                 # Both attempts blocked by cooldown, nothing streamed yet —
                 # walk the fallback chain (Gemini -> OpenRouter -> Cerebras
                 # -> Ollama); _call_fallback_chain_stream logs which one hit.
-                for piece in _call_fallback_chain_stream(prompt, max_tokens=max_tokens):
+                for piece in _call_fallback_chain_stream(prompt, max_tokens=max_tokens, temperature=temperature):
                     yielded_any = True
                     yield piece
                 return
@@ -1560,7 +1571,7 @@ def call_groq_stream(prompt: str, max_tokens: int = 500, model: str = None):
                 model=use_model,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=max_tokens,
-                temperature=0.0,
+                temperature=temperature,
                 stream=True,
                 timeout=GROQ_REQUEST_TIMEOUT,
                 reasoning_effort="low",
@@ -1623,7 +1634,7 @@ def call_groq_stream(prompt: str, max_tokens: int = 500, model: str = None):
                 # failure and substitutes GROQ_UNAVAILABLE_MSG, so an empty
                 # fallback chain (nothing configured / all down) degrades to
                 # the exact old behavior.
-                for piece in _call_fallback_chain_stream(prompt, max_tokens=max_tokens):
+                for piece in _call_fallback_chain_stream(prompt, max_tokens=max_tokens, temperature=temperature):
                     yield piece
                 return
 
@@ -3379,7 +3390,7 @@ def get_answer(question: str, chat_history: list = None,
     # session's) stale answer.
     if uploaded_context:
         final_prompt = _build_upload_prompt(question, uploaded_context, uploaded_filename or "the uploaded document")
-        answer_en = call_groq(final_prompt, max_tokens=500)
+        answer_en = call_groq(final_prompt, max_tokens=500, temperature=ANSWER_TEMPERATURE)
         if is_bad_answer(answer_en):
             # Distinguish "couldn't reach any LLM provider" from "the doc
             # doesn't answer this" — the generic GROQ_UNAVAILABLE_MSG reads
@@ -3425,7 +3436,7 @@ Available Data Summary:
 {META_CONTEXT}
 Question: {question}
 Max 100 words."""
-        answer_en = call_groq(prompt, max_tokens=400)
+        answer_en = call_groq(prompt, max_tokens=400, temperature=ANSWER_TEMPERATURE)
         answer = translate_answer(answer_en, target_lang)
         result = {"answer": answer, "source": "ESS Asset Index", "page": 0, "route": "meta", "cached": False, "language": _actual_answer_lang(answer, target_lang)}
         save_cache(question, answer, result["source"], result["page"], target_lang)
@@ -3464,7 +3475,7 @@ STRICT RULES:
 
 Question: {question}
 Answer:"""
-        answer_en = call_groq(final_prompt, max_tokens=500)
+        answer_en = call_groq(final_prompt, max_tokens=500, temperature=ANSWER_TEMPERATURE)
         best_source = f"ESS Database & {best_source}"
 
     elif csv_result:
@@ -3482,7 +3493,7 @@ RULES:
 
 Question: {question}
 Answer:"""
-        answer_en = call_groq(final_prompt, max_tokens=400)
+        answer_en = call_groq(final_prompt, max_tokens=400, temperature=ANSWER_TEMPERATURE)
         best_source = "ESS Statistical Database"
 
     elif pdf_context:
@@ -3523,7 +3534,7 @@ STRICT RULES:
 
 Question: {question}
 Answer:"""
-        answer_en = call_groq(final_prompt, max_tokens=700)
+        answer_en = call_groq(final_prompt, max_tokens=700, temperature=ANSWER_TEMPERATURE)
     else:
         effective_route = "fallback"
         final_prompt = f"""You are the ESS (Ethiopian Statistical Service) AI Assistant.
@@ -3531,7 +3542,7 @@ No matching database result or report text was found for this question.
 Reply in clear English, in one or two short sentences. Do not invent statistics or sources.
 Question: {question}
 Answer:"""
-        answer_en = call_groq(final_prompt, max_tokens=350)
+        answer_en = call_groq(final_prompt, max_tokens=350, temperature=ANSWER_TEMPERATURE)
 
     answer = translate_answer(answer_en, target_lang)
 
@@ -3745,7 +3756,7 @@ def _stream_or_translate(prompt: str, max_tokens: int, target_lang: str, unavail
     unavailable_msg = unavailable_msg or GROQ_UNAVAILABLE_MSG
     if target_lang != "am":
         full = ""
-        for piece in call_groq_stream(prompt, max_tokens=max_tokens):
+        for piece in call_groq_stream(prompt, max_tokens=max_tokens, temperature=ANSWER_TEMPERATURE):
             full += piece
             yield ("chunk", piece)
         if not full.strip():
@@ -3754,7 +3765,7 @@ def _stream_or_translate(prompt: str, max_tokens: int, target_lang: str, unavail
         yield ("done", {"answer": full})
         return
 
-    answer_en = call_groq(prompt, max_tokens=max_tokens)
+    answer_en = call_groq(prompt, max_tokens=max_tokens, temperature=ANSWER_TEMPERATURE)
     if is_bad_answer(answer_en):
         yield ("chunk", unavailable_msg)
         yield ("done", {"answer": unavailable_msg})
