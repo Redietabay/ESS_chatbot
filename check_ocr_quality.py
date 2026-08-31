@@ -8,10 +8,10 @@ Usage:
     (checks page 3, 1-indexed)
 """
 import sys
-import io
-import fitz
-import pytesseract
-from PIL import Image
+import io  # it is used to convert bytes to image
+import fitz  # it use to read pdf file
+import pytesseract  #use to change  image to text
+from PIL import Image # it is used to convert bytes to image
 
 def check_page(pdf_path, page_num_1indexed, lang="amh+eng", dpi=300):
     doc = fitz.open(pdf_path)

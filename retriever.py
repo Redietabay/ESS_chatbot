@@ -272,6 +272,73 @@ def search_documents(question: str, top_k: int = TOP_K, prefer_source: str = Non
 
 
 # ═══════════════════════════════════════
+# METADATA INDEX (by category)
+# ═══════════════════════════════════════
+# BUG THIS FIXES: rag.py used to figure out "which years of inflation
+# reports are indexed" and "which files match year X" by re-scanning raw
+# filenames on disk for the literal substrings "inflation" and "efy" (e.g.
+# only "...inflation-report-oct-efy-2018-final.pdf"-style names matched).
+# Any file that was indexed correctly (category="inflation", year=<...> in
+# its ChromaDB metadata) but named differently — e.g. "CPI_DEC_2022.pdf",
+# uploaded through the admin form or with a metadata.csv row — was
+# invisible to that logic, so the chatbot confidently claimed the data
+# wasn't indexed even though it was answerable. Reading straight from the
+# actual indexed metadata means ANY file, named however, is picked up as
+# long as it was categorized correctly at index time.
+def get_metadata_index(category: str) -> dict:
+    """Returns {year_string: [source_filenames, ...]} for every chunk
+    indexed under the given metadata `category`, read directly from
+    ChromaDB. This reflects what was actually indexed, regardless of the
+    source file's naming convention — unlike scanning PDF_FOLDER filenames
+    for keyword substrings.
+    """
+    try:
+        with _collection_lock:
+            result = collection.get(where={"category": category}, include=["metadatas"])
+    except Exception as e:
+        log.warning(f"get_metadata_index('{category}') failed: {e}")
+        return {}
+
+    index = {}
+    for meta in (result.get("metadatas") or []):
+        year = str(meta.get("year", "unknown"))
+        source = meta.get("source", "Unknown")
+        index.setdefault(year, set()).add(source)
+
+    return {year: sorted(sources) for year, sources in index.items()}
+
+
+def get_corpus_summary() -> dict:
+    """{category: {"chunks": int, "sources": int, "years": [sorted years]}}
+    for the whole indexed corpus — read live from ChromaDB metadata, same
+    approach as get_metadata_index(). Powers the admin observability
+    dashboard's "what's actually indexed" panel."""
+    try:
+        with _collection_lock:
+            result = collection.get(include=["metadatas"])
+    except Exception as e:
+        log.warning(f"get_corpus_summary() failed: {e}")
+        return {}
+
+    summary = {}
+    for meta in (result.get("metadatas") or []):
+        cat = meta.get("category", "general")
+        entry = summary.setdefault(cat, {"chunks": 0, "sources": set(), "years": set()})
+        entry["chunks"] += 1
+        entry["sources"].add(meta.get("source", "Unknown"))
+        entry["years"].add(str(meta.get("year", "unknown")))
+
+    return {
+        cat: {
+            "chunks": v["chunks"],
+            "sources": len(v["sources"]),
+            "years": sorted(v["years"]),
+        }
+        for cat, v in summary.items()
+    }
+
+
+# ═══════════════════════════════════════
 # FORMAT CONTEXT FOR GROQ
 # ═══════════════════════════════════════
 
@@ -331,4 +398,3 @@ if __name__ == "__main__":
         print(f"Year      : {results[0]['year']}")
         print(f"Preview   : {results[0]['text'][:200]}...")
         print("-" * 50)
-        

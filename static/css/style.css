@@ -17,21 +17,46 @@
 
 html {
     height: 100%;
-    overflow: hidden;
 }
 
 body {
     font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
     background: #1a1a2e;
     color: #e0e0e0;
+}
+
+/* Only the main chat page is locked (no page scroll) */
+body:not(.backend-bg):not(.auth-page) {
     display: flex;
     height: 100vh;
-    height: 100dvh; /* dynamic viewport height — 100vh alone is taller than the
-                        visible area on mobile Chrome/Safari (it includes the
-                        space behind the address bar), which is what was making
-                        the whole page scrollable and the sidebar look like it
-                        took over the screen. */
+    height: 100dvh;
     overflow: hidden;
+}
+
+/* Dashboard → scrollable */
+body.backend-bg:not(.auth-page) {
+    display: block !important;
+    height: auto !important;
+    min-height: 100vh !important;
+    min-height: 100dvh !important;
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+    background-color: #1a1a2e !important;
+}
+
+/* Login / Register / Add Report → centered + scrollable */
+body.auth-page {
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    justify-content: center !important;
+    height: auto !important;
+    min-height: 100vh !important;
+    min-height: 100dvh !important;
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+    padding: 40px 16px !important;
+    background-color: #1a1a2e !important;
 }
 
 /* ═══════════════════════════════════════
@@ -225,7 +250,7 @@ body {
     color: #fff;
 }
 
-/* EN / አማርኛ UI toggle — separate from the mic-language selector below */
+/* EN / አማርኛ UI toggle */
 .lang-toggle {
     display: flex;
     background: rgba(255,255,255,0.1);
@@ -248,7 +273,7 @@ body {
     font-weight: 700;
 }
 
-/* Guest question countdown — chat.js writes into this via updateGuestBanner() */
+/* Guest question countdown */
 .guest-banner {
     padding: 8px 24px;
     background: #16213e;
@@ -366,7 +391,7 @@ body {
     color: #5c7a94;
 }
 
-/* Msg Action Row with Copy & Spoken Controls */
+/* Msg Action Row */
 .msg-actions {
     margin-top: 10px;
     display: flex;
@@ -384,7 +409,6 @@ body {
     transition: all 0.2s ease;
 }
 
-/* Copy Button Styling */
 .copy-btn {
     background: transparent;
     color: #888;
@@ -395,7 +419,6 @@ body {
     border-color: #4fc3f7;
 }
 
-/* Spoken Feedback Button Styling (Green) */
 .speak-btn {
     background: transparent;
     color: #a7f3d0;
@@ -408,7 +431,6 @@ body {
     border-color: #10b981;
 }
 
-/* Speech Stop Button Styling (Red) */
 .stop-btn {
     background: transparent;
     color: #fca5a5;
@@ -421,7 +443,6 @@ body {
     border-color: #ef4444;
 }
 
-/* Subtle opacity state for non-active mouse-overs */
 .msg.bot .copy-btn, .msg.bot .speak-btn, .msg.bot .stop-btn {
     opacity: 0.5;
 }
@@ -442,7 +463,7 @@ body {
     border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
-/* Typing Indicator Animation */
+/* Typing Indicator */
 .typing-indicator {
     display: flex;
     gap: 5px;
@@ -471,7 +492,7 @@ body {
     40% { transform: scale(1.0); }
 }
 
-/* Suggestions Grid Layout */
+/* Suggestions Grid */
 .suggestions-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -501,7 +522,7 @@ body {
     transform: translateY(-2px);
 }
 
-/* Input Bottom Panel Row */
+/* Input Bottom Panel */
 .input-area {
     padding: 20px;
     background: #16213e;
@@ -514,7 +535,7 @@ body {
     max-width: 900px;
     margin: 0 auto;
     width: 100%;
-    align-items: center; /* Align buttons and text-area vertically center */
+    align-items: center;
 }
 
 #questionInput {
@@ -524,7 +545,7 @@ body {
     border: 1px solid #1e4d8c;
     border-radius: 8px;
     color: #fff;
-    font-size: 16px; /* keep >=16px so iOS Safari doesn't auto-zoom the page on focus */
+    font-size: 16px;
     line-height: 1.5;
     resize: none;
     overflow-y: hidden;
@@ -543,7 +564,7 @@ body {
 }
 .mic-status:empty { padding: 0; }
 
-/* Transient upload/mic feedback — replaces alert() popups */
+/* Toast */
 .toast {
     max-width: 900px;
     margin: 0 auto 10px auto;
@@ -601,7 +622,7 @@ body {
     transform: scale(1.03);
 }
 
-/* 🎙️ Speech Mic Input Button */
+/* Mic Button */
 .mic-btn {
     background: #1e4d8c;
     border: 1px solid #4fc3f7;
@@ -623,14 +644,13 @@ body {
     transform: scale(1.05);
 }
 
-/* 🔴 Recording State Pulse Effect */
 .mic-btn.recording {
     background: #ef4444;
     border-color: #ef4444;
     animation: pulse-ring 1.5s infinite;
 }
 
-/* 📎 Attach-document button — same shape/feel as .mic-btn */
+/* Attach button */
 .attach-btn {
     background: #1e4d8c;
     border: 1px solid #4fc3f7;
@@ -656,7 +676,7 @@ body {
     transform: none;
 }
 
-/* 📄 Attached-file chip, shown above the input row while a document is active */
+/* Upload chip */
 .upload-chip {
     max-width: 900px;
     margin: 0 auto 10px auto;
@@ -703,16 +723,10 @@ body {
 }
 
 /* ═══════════════════════════════════════
-   AUTHENTICATION UI OVERHAUL
+   AUTHENTICATION UI
    ═══════════════════════════════════════ */
-.auth-page {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    min-height: 100vh;
-}
 
-/* Premium Technical Abstract Matrix Pattern */
+/* Background pattern for backend pages */
 .backend-bg {
     background-color: #1a1a2e;
     background-image: 
@@ -728,8 +742,9 @@ body {
 
 .auth-container {
     width: 100%;
-    max-width: 400px;
+    max-width: 420px;
     padding: 20px;
+    margin: 0 auto;
 }
 
 .auth-logo {
@@ -835,7 +850,7 @@ body {
 }
 
 /* ═══════════════════════════════════════
-   SCROLLBAR CUSTOMIZATION
+   SCROLLBAR
    ═══════════════════════════════════════ */
 .session-list::-webkit-scrollbar,
 .messages-area::-webkit-scrollbar {
@@ -863,7 +878,7 @@ body {
     scrollbar-color: #1e4d8c transparent;
 }
 
-/* ── Mobile sidebar toggle (hamburger) — hidden on desktop, shown <=720px ── */
+/* Mobile sidebar toggle */
 .sidebar-toggle-btn {
     display: none;
     background: none;
@@ -885,18 +900,13 @@ body {
 }
 
 /* ═══════════════════════════════════════
-   RESPONSIVE MEDIA QUERIES
+   RESPONSIVE
    ═══════════════════════════════════════ */
 @media (max-width: 720px) {
-    body {
+    body:not(.backend-bg):not(.auth-page) {
         flex-direction: column;
     }
     .sidebar-toggle-btn { display: inline-flex; align-items: center; justify-content: center; }
-    /* Off-canvas drawer instead of stacking above the chat — the old
-       max-height:40vh approach pushed the actual chat below the fold on
-       first load, since the session list ate ~40% of the screen before
-       a single message was visible. Now the sidebar slides in over the
-       chat only when the hamburger is tapped. */
     .sidebar {
         position: fixed;
         top: 0;
@@ -943,7 +953,8 @@ body {
         font-size: 0.7rem;
     }
 }
-/* ── Markdown tables in bot answers ── */
+
+/* Markdown tables */
 .md-table-wrap { overflow-x: auto; margin: 8px 0; max-width: 100%; }
 .md-table { border-collapse: collapse; width: 100%; font-size: 0.85em; }
 .md-table th, .md-table td {

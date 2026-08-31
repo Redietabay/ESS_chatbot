@@ -81,15 +81,54 @@ def extract_text_from_page(page) -> str:
     return page.get_text().strip()
 
 
+def _preprocess_for_ocr(img: Image.Image) -> Image.Image:
+    """Lightweight, dependency-free preprocessing that measurably helps
+    Tesseract's accuracy — especially on Amharic (Ge'ez script), where the
+    model has less margin for error than English to begin with. Grayscale +
+    autocontrast gives Tesseract's own internal thresholding step a cleaner
+    input on the faint/uneven scans that make up most of the ESS corpus.
+
+    This does NOT close the underlying gap: Tesseract's Amharic model is
+    simply less mature than its English one (see OCR_LANG comment below) —
+    that's a library limitation, not something preprocessing can fix. What
+    this DOES fix is the *additional* error on top of that baseline caused
+    by low-contrast/low-quality scans, which in practice is the larger and
+    more fixable source of garbled Amharic OCR on real ESS reports.
+
+    For a bigger jump in Amharic accuracy than preprocessing alone can give,
+    swap the installed 'amh.traineddata' for the "best" (LSTM, higher
+    accuracy, slower) model from
+    https://github.com/tesseract-ocr/tessdata_best — download amh.traineddata
+    there and drop it into Tesseract's tessdata folder, replacing the
+    default "fast" one. One-time server-side change, no code change needed.
+    """
+    from PIL import ImageOps
+    gray = img.convert("L")
+    return ImageOps.autocontrast(gray, cutoff=1)
+
+
 def extract_text_with_ocr(page, ocr_available: bool, dpi: int = OCR_DPI, lang: str = OCR_LANG) -> str:
     """OCR fallback for a page with no usable embedded text layer.
-    Returns "" if OCR is unavailable or fails."""
+    Returns "" if OCR is unavailable or fails.
+
+    --psm 6 ("assume a single uniform block of text") is used instead of
+    Tesseract's default --psm 3. This does NOT recover real table
+    structure on a scanned page — see extract_tables_from_page's docstring
+    and the module-level comment in index_pdfs.py: pdfplumber only sees a
+    PDF's own vector/ruling lines, so a scanned table has nothing for it to
+    parse, full stop. What --psm 6 DOES do is stop Tesseract from merging
+    table rows into one run-on paragraph, which is its default behavior
+    under --psm 3 on a busy page. The result is OCR'd text where each row
+    roughly stays on its own line — not a real table, but far more usable
+    to a reader (or the LLM answering from it) than one long blob of text.
+    """
     if not ocr_available:
         return ""
     try:
         pix = page.get_pixmap(dpi=dpi)
         img = Image.open(io.BytesIO(pix.tobytes("png")))
-        text = pytesseract.image_to_string(img, lang=lang)
+        img = _preprocess_for_ocr(img)
+        text = pytesseract.image_to_string(img, lang=lang, config="--psm 6")
         return text.strip()
     except Exception as e:
         log.warning(f"   OCR failed on this page: {e}")

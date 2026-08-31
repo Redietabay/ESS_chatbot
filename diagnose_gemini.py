@@ -8,7 +8,7 @@ WHY the direct REST call to generateContent fails differently.
 Run:  python diagnose_gemini.py
 """
 import os
-import requests
+import requests  
 from dotenv import load_dotenv
 
 load_dotenv()

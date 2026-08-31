@@ -12,7 +12,7 @@ import psycopg2
 from dotenv import load_dotenv
 
 load_dotenv()
-
+0
 TABLE_SEP_RE = re.compile(r"^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$")
 
 

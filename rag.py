@@ -33,7 +33,7 @@ except ImportError:
 # repeated HuggingFace HEAD requests on startup).
 load_dotenv()
 
-from retriever import search_documents, format_context
+from retriever import search_documents, format_context, get_metadata_index
 
 # ═══════════════════════════════════════
 # UTF-8 FIX — Defensive Check
@@ -3110,27 +3110,42 @@ def _detect_requested_year(question: str):
     return None, False
 
 
-def _inflation_efy_years_indexed() -> set:
-    """Distinct EFY years actually indexed for inflation reports, read
-    straight from the PDF filenames on disk (PDF_TITLES, already loaded
-    above) — e.g. '...-efy-2018-final.pdf' -> 2018. Cheap regex scan over
-    ~60 titles, no ChromaDB/DB round trip, and it can't drift out of sync
-    with a reset_ocr_files.py-style partial re-index the way a hardcoded
-    list could."""
-    years = set()
-    for title in PDF_TITLES:
-        t = title.lower()
-        if "inflation" not in t:
-            continue
-        m = re.search(r"efy\s*(\d{4})", t)
-        if m:
-            years.add(int(m.group(1)))
+def _inflation_years_indexed() -> dict:
+    """{year:int -> [source filenames]} for every chunk actually indexed
+    under metadata category="inflation", read live from ChromaDB.
+
+    Replaces the old approach of regex-scanning filenames on disk for the
+    literal substrings "inflation" and "efy" (e.g. only names like
+    "...inflation-report-oct-efy-2018-final.pdf" ever matched). A file
+    indexed correctly — via metadata.csv, the bulk indexer's category
+    guess, or the /admin/add_report upload — but named differently (e.g.
+    "CPI_DEC_2022.pdf") was invisible to that scan, so the chatbot
+    confidently claimed data wasn't indexed even though it was. Metadata is
+    the source of truth; filenames are not.
+
+    Called fresh on every request (not cached at import time) because a
+    report can be added through /admin/add_report while the app is
+    running — the whole point of that route (see report_indexer.py) is
+    that it's answerable immediately, without an app restart.
+
+    The stored "year" value isn't guaranteed to already be an EFY year —
+    it's whatever metadata.csv / guess_year() / the admin form set it to,
+    which for an EFY-named legacy file happens to BE the EFY year, but for
+    a plainly Gregorian-named file (e.g. "CPI_DEC_2022.pdf" -> "2022") is a
+    Gregorian year instead. This function just returns what's indexed, as
+    indexed; _run_pdf_search below checks a requested year against both
+    conventions rather than assuming one or the other.
+    """
+    years = {}
+    for year_str, sources in get_metadata_index("inflation").items():
+        if year_str.isdigit():
+            years.setdefault(int(year_str), []).extend(sources)
     return years
 
 
-_INFLATION_EFY_YEARS = _inflation_efy_years_indexed()
-if _INFLATION_EFY_YEARS:
-    log.info(f"Inflation reports indexed for EFY years: {sorted(_INFLATION_EFY_YEARS)}")
+def _inflation_efy_years_indexed() -> set:
+    """Back-compat convenience: just the set of indexed year numbers."""
+    return set(_inflation_years_indexed().keys())
 
 # ═══════════════════════════════════════
 # MONTH-AWARE INFLATION FILE MATCHING
@@ -3175,26 +3190,26 @@ def _detect_requested_month(question: str) -> str:
 def _inflation_filenames_for(year: int, month_token: str = None) -> list:
     """Raw filenames (exactly as stored in ChromaDB's 'source' metadata —
     see index_pdfs.py, which writes pdf_file, the unmodified os.listdir()
-    name) of indexed inflation reports matching the given EFY year,
-    optionally narrowed to one month. Scans PDF_FOLDER directly rather than
-    PDF_TITLES, since PDF_TITLES strips the underscores/hyphens that the
-    real 'source' field still has — a transformed title can't be used as a
-    ChromaDB filter value."""
-    if not os.path.exists(PDF_FOLDER):
+    name) of indexed inflation reports matching the given year.
+
+    Looked up from live ChromaDB metadata (category="inflation", year=
+    <year>) instead of re-scanning PDF_FOLDER filenames for the literal
+    substring "inflation" — that scan missed any correctly-indexed report
+    named differently (e.g. "CPI_DEC_2022.pdf"). Month narrowing is still
+    done against the filename, since month isn't currently stored as its
+    own metadata field at index time; if none of the matched files' names
+    happen to mention the requested month, all year-matches are returned
+    rather than filtering down to zero — better to let embedding
+    similarity pick the right month among real candidates than to discard
+    them all over a naming quirk.
+    """
+    sources = _inflation_years_indexed().get(year, [])
+    if not sources:
         return []
-    matches = []
-    for f in os.listdir(PDF_FOLDER):
-        if not f.lower().endswith(".pdf"):
-            continue
-        name = f.lower()
-        if "inflation" not in name:
-            continue
-        if str(year) not in name:
-            continue
-        if month_token and month_token not in name:
-            continue
-        matches.append(f)
-    return matches
+    if not month_token:
+        return sources
+    narrowed = [f for f in sources if month_token in f.lower()]
+    return narrowed if narrowed else sources
 
 PER_FILE_SCHEMA = build_per_file_schema(CSV_DATA)
 META_CONTEXT = "CSV DATASETS:\n" + "".join(list(PER_FILE_SCHEMA.values())) + "\nPDF REPORTS:\n" + "\n".join(PDF_TITLES)
@@ -3237,6 +3252,62 @@ def _gather_sources(question: str, route: str, original_question: str = None):
     return csv_result, pdf_context, best_source, best_page
 
 
+# ═══════════════════════════════════════
+# GENERIC METADATA-FIRST PREFILTER (non-inflation categories)
+# ═══════════════════════════════════════
+# Same idea as the inflation-specific block above — prefer an exact
+# (category, year) metadata match over letting embedding similarity alone
+# sort out same-topic-different-year chunks — generalized to every other
+# category. Deliberately SOFT, unlike the inflation path: if no metadata
+# match is found here, we fall through to ordinary similarity search
+# rather than refusing outright. Other categories don't have inflation's
+# rigid "one file per month" structure or its well-tested EFY messaging,
+# so a hard refusal here risks false negatives on report types this
+# hasn't been validated against yet.
+_CATEGORY_KEYWORDS = {
+    "population":    ["population", "demographic", "census"],
+    "agriculture":   ["agricultur", "crop", "livestock", "farm"],
+    "trade":         ["trade", "import", "export"],
+    "manufacturing": ["manufactur"],
+    "labour":        ["labour", "labor", "migration", "employment", "unemployment"],
+    "housing":       ["housing"],
+    "land":          ["land utilization", "land use", "land area"],
+    "household":     ["consumption", "welfare", "household"],
+}
+
+
+def _detect_requested_category(question: str) -> str:
+    q = question.lower()
+    for category, keywords in _CATEGORY_KEYWORDS.items():
+        if any(k in q for k in keywords):
+            return category
+    return None
+
+
+def _generic_metadata_source_in(question: str, year_detection_text: str) -> list:
+    """Best-effort (category, year) -> filenames lookup for any non-price
+    question. Returns None (not []) whenever it can't confidently narrow
+    the search, so the caller knows to fall back to plain similarity
+    rather than treating "no match" as "restrict to nothing"."""
+    category = _detect_requested_category(question)
+    if not category:
+        return None
+    requested_year, is_explicit_efy = _detect_requested_year(year_detection_text)
+    if requested_year is None:
+        return None
+    candidate_years = (
+        [requested_year] if is_explicit_efy
+        else _gregorian_to_efy_candidates(requested_year) + [requested_year]
+    )
+    metadata_index = get_metadata_index(category)
+    for y in candidate_years:
+        sources = metadata_index.get(str(y))
+        if sources:
+            log.info(f"Metadata prefilter: restricting to {len(sources)} file(s) for category={category}, year={y}")
+            return sources
+    return None
+
+
 def _run_pdf_search(question: str, original_question: str = None):
     prefer_source = _preferred_source_for(question)
     inflation_source_in = None
@@ -3264,16 +3335,26 @@ def _run_pdf_search(question: str, original_question: str = None):
     # model to notice and explain the year mismatch buried in prose,
     # which is exactly what produced confusing non-answers before. An
     # explicit, specific notice is clearer for both the model and the user.
-    if any(k in question.lower() for k in _PRICE_KEYWORDS) and _INFLATION_EFY_YEARS:
+    indexed_inflation_years = _inflation_efy_years_indexed()
+    if any(k in question.lower() for k in _PRICE_KEYWORDS) and indexed_inflation_years:
         requested_year, is_explicit_efy = _detect_requested_year(year_detection_text)
         if requested_year is not None:
+            # Indexed reports aren't guaranteed to all use the same
+            # calendar in their "year" metadata — a legacy
+            # "...efy-2018-final.pdf" file has an EFY year stored, but a
+            # newly uploaded "CPI_DEC_2022.pdf" has a plain Gregorian year
+            # stored. So for a bare (non-explicit-EFY) requested year,
+            # check it BOTH ways: as a literal year (matches
+            # Gregorian-labeled files) and converted to its EFY candidates
+            # (matches EFY-labeled files) — rather than assuming every
+            # indexed report follows one convention.
             candidate_efys = (
                 [requested_year] if is_explicit_efy
-                else _gregorian_to_efy_candidates(requested_year)
+                else _gregorian_to_efy_candidates(requested_year) + [requested_year]
             )
-            matched_efys = [y for y in candidate_efys if y in _INFLATION_EFY_YEARS]
+            matched_efys = [y for y in candidate_efys if y in indexed_inflation_years]
             if not matched_efys:
-                available = ", ".join(f"EFY {y}" for y in sorted(_INFLATION_EFY_YEARS))
+                available = ", ".join(str(y) for y in sorted(indexed_inflation_years))
                 if is_explicit_efy:
                     year_note = f"EFY {requested_year}"
                 else:
@@ -3284,10 +3365,12 @@ def _run_pdf_search(question: str, original_question: str = None):
                 )
                 notice = (
                     f"NO MATCHING REPORT INDEXED. The user asked about {year_note}, but no "
-                    f"inflation report for that period is indexed. The inflation reports that "
-                    f"ARE indexed cover: {available} only. State this plainly, including both "
-                    f"the year the user asked about and which years are actually available — "
-                    f"do not guess or substitute a figure from a different year."
+                    f"inflation report for that period is indexed. The inflation report years "
+                    f"that ARE indexed: {available} (each as labeled on the source file — may "
+                    f"be EFY or Gregorian depending on the report). State this plainly, "
+                    f"including both the year the user asked about and which years are "
+                    f"actually available — do not guess or substitute a figure from a "
+                    f"different year."
                 )
                 return notice, "ESS Inflation Reports Index", 0
 
@@ -3305,6 +3388,13 @@ def _run_pdf_search(question: str, original_question: str = None):
                     f"Restricting inflation search to {len(matches)} file(s) for "
                     f"EFY {year_for_filenames}" + (f" ({month_token})" if month_token else " (all months)")
                 )
+    else:
+        # Not a price/inflation question — try the generic, soft
+        # metadata-first prefilter instead (see comment above its
+        # definition). No-op (None) if the question doesn't name a
+        # recognizable category+year combination.
+        inflation_source_in = _generic_metadata_source_in(question, year_detection_text)
+
     try:
         results = search_documents(
             question,

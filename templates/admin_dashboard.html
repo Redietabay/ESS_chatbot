@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - ESS Chatbot</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <style>
+        .chart-unavailable { display:flex; align-items:center; justify-content:center; height:100%; color:#7f93b3; font-size:0.8rem; text-align:center; padding:0 16px; }
+        .dash-wrap { max-width: 1100px; margin: 0 auto; padding: 24px 16px 60px; }
+        .dash-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; flex-wrap:wrap; gap:10px; }
+        .dash-header h1 { color:#4fc3f7; font-size:1.4rem; margin:0; }
+        .dash-header a { color:#9fc7f7; text-decoration:none; font-size:0.85rem; }
+        .dash-meta { display:flex; align-items:center; gap:8px; font-size:0.75rem; color:#7f93b3; margin-bottom:20px; flex-wrap:wrap; }
+        .live-dot { width:8px; height:8px; border-radius:50%; background:#10b981; display:inline-block; animation: live-pulse 1.6s infinite; }
+        @keyframes live-pulse { 0%,100%{ opacity:1; box-shadow:0 0 0 0 rgba(16,185,129,0.5);} 50%{ opacity:0.6; box-shadow:0 0 0 5px rgba(16,185,129,0);} }
+        .live-dot.paused { background:#7f93b3; animation:none; }
+        .refresh-toggle { background:none; border:1px solid #1e4d8c; color:#9fc7f7; border-radius:6px; padding:2px 8px; font-size:0.72rem; cursor:pointer; margin-left:6px; }
+        .refresh-toggle:hover { background:#1a3557; }
+        .dash-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:14px; margin-bottom:24px; }
+        .dash-card { background:#142845; border:1px solid #1e4d8c; border-radius:10px; padding:16px; transition: box-shadow 0.3s ease, border-color 0.3s ease; }
+        .dash-card .num { font-size:1.8rem; font-weight:700; color:#e8eef7; }
+        .dash-card .label { font-size:0.78rem; color:#9fc7f7; margin-top:4px; }
+        .dash-card.flash { border-color:#4fc3f7; box-shadow:0 0 0 3px rgba(79,195,247,0.18); }
+        .dash-section { background:#0f1a2e; border:1px solid #1e4d8c; border-radius:10px; padding:16px; margin-bottom:20px; }
+        .dash-section h2 { color:#4fc3f7; font-size:1.05rem; margin:0 0 12px 0; display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+        .dash-charts-row { display:grid; grid-template-columns: 2fr 1fr; gap:16px; margin-bottom:20px; }
+        @media (max-width: 720px) { .dash-charts-row { grid-template-columns: 1fr; } }
+        .chart-box { position:relative; height:220px; }
+        .chart-box.small { height:200px; }
+        table.dash-table { width:100%; border-collapse:collapse; font-size:0.85rem; }
+        table.dash-table th, table.dash-table td { text-align:left; padding:7px 8px; border-bottom:1px solid #1e4d8c; color:#e8eef7; }
+        table.dash-table th { color:#9fc7f7; font-weight:600; cursor:pointer; user-select:none; }
+        table.dash-table th:hover { color:#4fc3f7; }
+        .pill { display:inline-block; padding:2px 8px; border-radius:10px; font-size:0.72rem; font-weight:600; }
+        .pill-ok { background:rgba(16,185,129,0.15); color:#8ff0cf; }
+        .pill-fail { background:rgba(239,68,68,0.15); color:#ffb4b4; }
+        .empty-row { color:#7f93b3; font-size:0.82rem; padding:10px 0; }
+        .filter-row { display:flex; gap:6px; flex-wrap:wrap; }
+        .filter-chip { background:#142845; border:1px solid #1e4d8c; color:#9fc7f7; border-radius:14px; padding:3px 10px; font-size:0.72rem; cursor:pointer; }
+        .filter-chip.active { background:#4fc3f7; color:#06263d; border-color:#4fc3f7; font-weight:600; }
+        tr.row-new { animation: row-in 1.2s ease; }
+        @keyframes row-in { from{ background:rgba(79,195,247,0.25);} to{ background:transparent; } }
+    </style>
+</head>
+<body class="backend-bg">
+    <div class="dash-wrap">
+        <div class="dash-header">
+            <h1>📊 ESS Chatbot — Observability Dashboard</h1>
+            <div style="display:flex; gap:14px;">
+                <a href="/admin/add_report">+ Add Report</a>
+                <a href="/chat">← Back to Chat</a>
+            </div>
+        </div>
+        <div class="dash-meta">
+            <span class="live-dot" id="liveDot"></span>
+            <span id="liveLabel">Live — updates every 8s</span>
+            <span id="lastUpdated"></span>
+            <button type="button" class="refresh-toggle" id="pauseBtn">Pause</button>
+            <button type="button" class="refresh-toggle" id="refreshNowBtn">Refresh now</button>
+        </div>
+
+        <div class="dash-grid" id="statsGrid">
+            <div class="dash-card" data-card="total_24h">
+                <div class="num" id="stat-total_24h">{{ stats.total_24h }}</div>
+                <div class="label">Questions (24h)</div>
+            </div>
+            <div class="dash-card" data-card="cache_hit_rate">
+                <div class="num"><span id="stat-cache_hit_rate">{{ stats.cache_hit_rate }}</span>%</div>
+                <div class="label">Cache hit rate (24h)</div>
+            </div>
+            <div class="dash-card" data-card="avg_latency_ms">
+                <div class="num" id="stat-avg_latency_ms">{{ stats.avg_latency_ms if stats.avg_latency_ms else '—' }}{% if stats.avg_latency_ms %}ms{% endif %}</div>
+                <div class="label">Avg latency, uncached (24h)</div>
+            </div>
+            <div class="dash-card" data-card="errors_24h">
+                <div class="num" id="stat-errors_24h">{{ stats.errors_24h }}</div>
+                <div class="label">Errors (24h)</div>
+            </div>
+            <div class="dash-card" data-card="documents_indexed">
+                <div class="num" id="stat-documents_indexed">{{ stats.documents_indexed }}</div>
+                <div class="label">PDFs indexed (all time)</div>
+            </div>
+            <div class="dash-card" data-card="ocr_pages_total">
+                <div class="num" id="stat-ocr_pages_total">{{ stats.ocr_pages_total }}</div>
+                <div class="label">Pages recovered via OCR</div>
+            </div>
+            <div class="dash-card" data-card="groq_budget">
+                <div class="num"><span id="stat-groq_budget">{{ (stats.groq_budget.ratio * 100) | round(1) }}</span>%</div>
+                <div class="label">Groq daily token budget used</div>
+            </div>
+        </div>
+
+        <div class="dash-charts-row">
+            <div class="dash-section">
+                <h2>Traffic, last 24h</h2>
+                <div class="chart-box"><canvas id="trafficChart"></canvas></div>
+            </div>
+            <div class="dash-section">
+                <h2>Corpus by category</h2>
+                <div class="chart-box small"><canvas id="corpusChart"></canvas></div>
+            </div>
+        </div>
+
+        <div class="dash-section">
+            <h2>Traffic by route (24h)</h2>
+            <table class="dash-table" id="routeTable">
+                <thead><tr><th>Route</th><th>Requests</th><th>Avg latency (uncached)</th></tr></thead>
+                <tbody>
+                {% for r in stats.by_route %}
+                <tr>
+                    <td>{{ r.route }}</td>
+                    <td>{{ r.count }}</td>
+                    <td>{{ (r.avg_latency_ms ~ 'ms') if r.avg_latency_ms else '—' }}</td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+            <div class="empty-row" id="routeEmpty" style="{{ 'display:none;' if stats.by_route else '' }}">No traffic recorded yet in the last 24 hours.</div>
+        </div>
+
+        <div class="dash-section">
+            <h2>Indexed corpus, by category</h2>
+            <table class="dash-table" id="corpusTable">
+                <thead><tr><th>Category</th><th>Chunks</th><th>Source files</th><th>Years indexed</th></tr></thead>
+                <tbody>
+                {% for cat, v in stats.corpus_by_category.items() %}
+                <tr>
+                    <td>{{ cat }}</td>
+                    <td>{{ v.chunks }}</td>
+                    <td>{{ v.sources }}</td>
+                    <td>{{ v.years | join(', ') }}</td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+            <div class="empty-row" id="corpusEmpty" style="{{ 'display:none;' if stats.corpus_by_category else '' }}">No documents indexed yet.</div>
+        </div>
+
+        <div class="dash-section">
+            <h2>
+                <span>Recent "Add Report" activity (audit log)</span>
+                <span class="filter-row" id="statusFilter">
+                    <span class="filter-chip active" data-filter="all">All</span>
+                    <span class="filter-chip" data-filter="ok">OK</span>
+                    <span class="filter-chip" data-filter="fail">Failed</span>
+                </span>
+            </h2>
+            <table class="dash-table" id="reportsTable">
+                <thead><tr><th>When</th><th>File</th><th>By</th><th>Category / Year</th><th>Chunks</th><th>Status</th></tr></thead>
+                <tbody>
+                {% for r in stats.recent_reports %}
+                <tr data-status="{{ 'ok' if r.success else 'fail' }}">
+                    <td>{{ r.created_at }}</td>
+                    <td>{{ r.filename }}</td>
+                    <td>{{ r.username }}</td>
+                    <td>{{ r.category }} / {{ r.year }}</td>
+                    <td>{{ r.chunks_added if r.chunks_added is not none else '—' }}</td>
+                    <td>
+                        {% if r.success %}<span class="pill pill-ok">OK</span>
+                        {% else %}<span class="pill pill-fail" title="{{ r.error_message }}">Failed</span>{% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+            <div class="empty-row" id="reportsEmpty" style="{{ 'display:none;' if stats.recent_reports else '' }}">No reports added yet.</div>
+        </div>
+    </div>
+
+    <script>
+    (function () {
+        const REFRESH_MS = 8000;
+        let paused = false;
+        let timer = null;
+        let lastReportKey = null; // "filename|created_at" of the newest row, to detect genuinely new entries
+
+        const dot = document.getElementById('liveDot');
+        const liveLabel = document.getElementById('liveLabel');
+        const lastUpdatedEl = document.getElementById('lastUpdated');
+        const pauseBtn = document.getElementById('pauseBtn');
+        const refreshNowBtn = document.getElementById('refreshNowBtn');
+
+        function fmtTime(d) {
+            return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        }
+
+        function flashCard(id) {
+            const card = document.querySelector(`[data-card="${id}"]`);
+            if (!card) return;
+            card.classList.add('flash');
+            setTimeout(() => card.classList.remove('flash'), 700);
+        }
+
+        function setStat(id, value, suffix) {
+            const el = document.getElementById('stat-' + id);
+            if (!el) return;
+            const newText = (value === null || value === undefined) ? '—' : String(value) + (suffix || '');
+            if (el.textContent !== newText) {
+                el.textContent = newText;
+                flashCard(id);
+            }
+        }
+
+        // ── Charts (optional) ──
+        // Chart.js is loaded from a CDN (see the loader script at the very
+        // bottom of the page, which tries two CDNs before giving up). If
+        // BOTH fail — e.g. the server has no outbound internet access to
+        // those CDNs, or a firewall blocks them — `Chart` will be
+        // undefined here. Everything in this block is guarded so that
+        // case just means "no charts", never "the whole dashboard breaks":
+        // live stats, tables, sorting and filtering all keep working
+        // without Chart.js.
+        let trafficChart = null;
+        let corpusChart = null;
+
+        function showChartUnavailable(canvasId) {
+            const canvas = document.getElementById(canvasId);
+            if (!canvas) return;
+            const box = canvas.closest('.chart-box');
+            if (box) {
+                box.innerHTML = '<div class="chart-unavailable">Chart library failed to load (no network access to the CDN?) — numbers above and the tables below still update live.</div>';
+            }
+        }
+
+        function initCharts() {
+            if (typeof Chart === 'undefined') {
+                showChartUnavailable('trafficChart');
+                showChartUnavailable('corpusChart');
+                return;
+            }
+
+            try {
+                const trafficCtx = document.getElementById('trafficChart').getContext('2d');
+                trafficChart = new Chart(trafficCtx, {
+                    type: 'line',
+                    data: {
+                        labels: {{ stats.hourly_labels | tojson }},
+                        datasets: [{
+                            label: 'Questions',
+                            data: {{ stats.hourly_counts | tojson }},
+                            borderColor: '#4fc3f7',
+                            backgroundColor: 'rgba(79,195,247,0.15)',
+                            fill: true,
+                            tension: 0.3,
+                            pointRadius: 2,
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { display: false } },
+                        scales: {
+                            x: { ticks: { color: '#9fc7f7', maxTicksLimit: 8 }, grid: { color: 'rgba(30,77,140,0.3)' } },
+                            y: { beginAtZero: true, ticks: { color: '#9fc7f7', precision: 0 }, grid: { color: 'rgba(30,77,140,0.3)' } }
+                        }
+                    }
+                });
+
+                const corpusCtx = document.getElementById('corpusChart').getContext('2d');
+                const corpusInitial = {{ stats.corpus_by_category | tojson }};
+                corpusChart = new Chart(corpusCtx, {
+                    type: 'bar',
+                    data: {
+                        labels: Object.keys(corpusInitial),
+                        datasets: [{
+                            label: 'Chunks',
+                            data: Object.values(corpusInitial).map(v => v.chunks),
+                            backgroundColor: '#4fc3f7',
+                            borderRadius: 4,
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { display: false } },
+                        scales: {
+                            x: { ticks: { color: '#9fc7f7', autoSkip: false, maxRotation: 60, minRotation: 30 }, grid: { display: false } },
+                            y: { beginAtZero: true, ticks: { color: '#9fc7f7', precision: 0 }, grid: { color: 'rgba(30,77,140,0.3)' } }
+                        }
+                    }
+                });
+            } catch (err) {
+                console.error('Chart init failed:', err);
+                showChartUnavailable('trafficChart');
+                showChartUnavailable('corpusChart');
+            }
+        }
+
+        function updateTrafficChart(labels, counts) {
+            if (!trafficChart) return;
+            trafficChart.data.labels = labels;
+            trafficChart.data.datasets[0].data = counts;
+            trafficChart.update('none');
+        }
+
+        function updateCorpusChart(corpus) {
+            if (!corpusChart) return;
+            const labels = Object.keys(corpus);
+            corpusChart.data.labels = labels;
+            corpusChart.data.datasets[0].data = labels.map(k => corpus[k].chunks);
+            corpusChart.update('none');
+        }
+
+        // ── Table renderers ──
+        function renderRouteTable(rows) {
+            const tbody = document.querySelector('#routeTable tbody');
+            const empty = document.getElementById('routeEmpty');
+            if (!rows || !rows.length) {
+                tbody.innerHTML = '';
+                empty.style.display = 'block';
+                return;
+            }
+            empty.style.display = 'none';
+            tbody.innerHTML = rows.map(r => `
+                <tr>
+                    <td>${escapeHtml(r.route)}</td>
+                    <td>${r.count}</td>
+                    <td>${r.avg_latency_ms ? r.avg_latency_ms + 'ms' : '—'}</td>
+                </tr>`).join('');
+        }
+
+        function renderCorpusTable(corpus) {
+            const tbody = document.querySelector('#corpusTable tbody');
+            const empty = document.getElementById('corpusEmpty');
+            const cats = Object.keys(corpus);
+            if (!cats.length) {
+                tbody.innerHTML = '';
+                empty.style.display = 'block';
+                return;
+            }
+            empty.style.display = 'none';
+            tbody.innerHTML = cats.map(cat => {
+                const v = corpus[cat];
+                return `<tr>
+                    <td>${escapeHtml(cat)}</td>
+                    <td>${v.chunks}</td>
+                    <td>${v.sources}</td>
+                    <td>${(v.years || []).join(', ')}</td>
+                </tr>`;
+            }).join('');
+        }
+
+        function currentReportFilter() {
+            const active = document.querySelector('#statusFilter .filter-chip.active');
+            return active ? active.dataset.filter : 'all';
+        }
+
+        let lastReports = [];
+        function renderReportsTable(rows) {
+            lastReports = rows || [];
+            const tbody = document.querySelector('#reportsTable tbody');
+            const empty = document.getElementById('reportsEmpty');
+            const filter = currentReportFilter();
+            const filtered = lastReports.filter(r => filter === 'all' || (filter === 'ok' ? r.success : !r.success));
+
+            if (!lastReports.length) {
+                tbody.innerHTML = '';
+                empty.style.display = 'block';
+                return;
+            }
+            empty.style.display = 'none';
+
+            const newestKey = lastReports.length ? (lastReports[0].filename + '|' + lastReports[0].created_at) : null;
+            const isFirstLoad = lastReportKey === null;
+
+            tbody.innerHTML = filtered.map(r => {
+                const key = r.filename + '|' + r.created_at;
+                const isNew = !isFirstLoad && key === newestKey && newestKey !== lastReportKey;
+                const statusPill = r.success
+                    ? '<span class="pill pill-ok">OK</span>'
+                    : `<span class="pill pill-fail" title="${escapeHtml(r.error_message || '')}">Failed</span>`;
+                return `<tr data-status="${r.success ? 'ok' : 'fail'}" class="${isNew ? 'row-new' : ''}">
+                    <td>${escapeHtml(r.created_at)}</td>
+                    <td>${escapeHtml(r.filename)}</td>
+                    <td>${escapeHtml(r.username)}</td>
+                    <td>${escapeHtml(String(r.category))} / ${escapeHtml(String(r.year))}</td>
+                    <td>${r.chunks_added !== null && r.chunks_added !== undefined ? r.chunks_added : '—'}</td>
+                    <td>${statusPill}</td>
+                </tr>`;
+            }).join('');
+
+            lastReportKey = newestKey;
+        }
+
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, c => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            }[c]));
+        }
+
+        // Filter chips for the audit log
+        document.getElementById('statusFilter').addEventListener('click', function (e) {
+            const chip = e.target.closest('.filter-chip');
+            if (!chip) return;
+            document.querySelectorAll('#statusFilter .filter-chip').forEach(c => c.classList.remove('active'));
+            chip.classList.add('active');
+            renderReportsTable(lastReports);
+        });
+
+        // Sortable route table (click a header to sort by that column)
+        document.querySelectorAll('#routeTable th').forEach((th, idx) => {
+            let asc = true;
+            th.addEventListener('click', function () {
+                const tbody = document.querySelector('#routeTable tbody');
+                const rows = Array.from(tbody.querySelectorAll('tr'));
+                rows.sort((a, b) => {
+                    const av = a.children[idx].textContent.trim();
+                    const bv = b.children[idx].textContent.trim();
+                    const an = parseFloat(av), bn = parseFloat(bv);
+                    const cmp = (!isNaN(an) && !isNaN(bn)) ? an - bn : av.localeCompare(bv);
+                    return asc ? cmp : -cmp;
+                });
+                rows.forEach(r => tbody.appendChild(r));
+                asc = !asc;
+            });
+        });
+
+        function applyStats(stats) {
+            setStat('total_24h', stats.total_24h);
+            setStat('cache_hit_rate', stats.cache_hit_rate);
+            setStat('avg_latency_ms', stats.avg_latency_ms, stats.avg_latency_ms ? 'ms' : '');
+            setStat('errors_24h', stats.errors_24h);
+            setStat('documents_indexed', stats.documents_indexed);
+            setStat('ocr_pages_total', stats.ocr_pages_total);
+            setStat('groq_budget', stats.groq_budget && stats.groq_budget.ratio !== undefined
+                ? Math.round(stats.groq_budget.ratio * 1000) / 10 : null);
+
+            updateTrafficChart(stats.hourly_labels || [], stats.hourly_counts || []);
+            updateCorpusChart(stats.corpus_by_category || {});
+            renderRouteTable(stats.by_route || []);
+            renderCorpusTable(stats.corpus_by_category || {});
+            renderReportsTable(stats.recent_reports || []);
+
+            lastUpdatedEl.textContent = '· updated ' + fmtTime(new Date());
+        }
+
+        async function refresh() {
+            try {
+                const res = await fetch('/admin/dashboard/data', { credentials: 'same-origin' });
+                if (!res.ok) throw new Error('bad status ' + res.status);
+                const data = await res.json();
+                applyStats(data);
+            } catch (err) {
+                console.error('Dashboard refresh failed:', err);
+            }
+        }
+
+        function scheduleNext() {
+            if (paused) return;
+            timer = setTimeout(async () => { await refresh(); scheduleNext(); }, REFRESH_MS);
+        }
+
+        pauseBtn.addEventListener('click', function () {
+            paused = !paused;
+            if (paused) {
+                clearTimeout(timer);
+                dot.classList.add('paused');
+                liveLabel.textContent = 'Paused';
+                pauseBtn.textContent = 'Resume';
+            } else {
+                dot.classList.remove('paused');
+                liveLabel.textContent = 'Live — updates every 8s';
+                pauseBtn.textContent = 'Pause';
+                scheduleNext();
+            }
+        });
+
+        refreshNowBtn.addEventListener('click', refresh);
+
+        // Prime lastReportKey from the server-rendered rows so the very
+        // first poll doesn't mistakenly flag every row as "new".
+        (function primeInitialReportKey() {
+            const firstRow = document.querySelector('#reportsTable tbody tr');
+            if (firstRow) {
+                lastReportKey = firstRow.children[0].textContent.trim() + '|' + firstRow.children[1].textContent.trim();
+            }
+        })();
+
+        // Kick off polling
+        scheduleNext();
+
+        // Pause polling when the tab isn't visible, resume when it is —
+        // saves requests without the admin having to remember to hit Pause.
+        document.addEventListener('visibilitychange', function () {
+            if (document.hidden) {
+                clearTimeout(timer);
+            } else if (!paused) {
+                refresh();
+                scheduleNext();
+            }
+        });
+
+        // Charts are initialized once the Chart.js loader below has
+        // either succeeded or given up on both CDNs.
+        window.addEventListener('chartjs-ready', initCharts);
+        if (window.__chartjsLoadAttempted) initCharts(); // loader already ran before this script
+    })();
+    </script>
+
+    <script>
+    // ── Resilient Chart.js loader ──
+    // Tries cdnjs first, falls back to jsdelivr if that fails (e.g. one
+    // CDN is blocked by a firewall but the other isn't), and gives up
+    // cleanly if neither works — the rest of the dashboard above doesn't
+    // depend on this succeeding.
+    (function loadChartJs() {
+        const sources = [
+            'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js',
+            'https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js'
+        ];
+        function tryLoad(i) {
+            if (i >= sources.length) {
+                window.__chartjsLoadAttempted = true;
+                window.dispatchEvent(new Event('chartjs-ready'));
+                return;
+            }
+            const s = document.createElement('script');
+            s.src = sources[i];
+            s.onload = function () {
+                window.__chartjsLoadAttempted = true;
+                window.dispatchEvent(new Event('chartjs-ready'));
+            };
+            s.onerror = function () { tryLoad(i + 1); };
+            document.head.appendChild(s);
+        }
+        tryLoad(0);
+    })();
+    </script>
+</body>
+</html>

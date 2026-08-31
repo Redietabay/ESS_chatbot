@@ -23,6 +23,17 @@ from pdf_extract import (
     OCR_DPI,
 )
 
+# Chunking / category-guessing / metadata.csv helpers now live in
+# indexing_helpers.py so this bulk script and the new /admin/add_report
+# route (report_indexer.py) can never drift apart on these rules. See that
+# file for the actual implementations.
+from indexing_helpers import (
+    chunk_text,
+    guess_category,
+    guess_year,
+    load_metadata_csv as _load_metadata_csv,
+)
+
 load_dotenv()
 
 # ═══════════════════════════════════════
@@ -150,39 +161,20 @@ def mark_file_complete(conn, filename: str, chunk_count: int, ocr_pages: int = 0
 # METADATA CSV
 # ══════════════════════════════════════
 # data/pdf/metadata.csv columns: filename,category,year
+# (load_metadata_csv itself now lives in indexing_helpers.py — this is a
+# thin wrapper so the rest of this file doesn't need to change.)
 
 def load_metadata_csv():
-    meta_path = os.path.join(PDF_FOLDER, "metadata.csv")
-    metadata_map = {}
-    if os.path.exists(meta_path):
-        with open(meta_path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                metadata_map[row["filename"]] = {
-                    "category": row.get("category", "general"),
-                    "year": row.get("year", "unknown")
-                }
+    metadata_map = _load_metadata_csv(PDF_FOLDER)
+    if metadata_map:
         log.info(f"Loaded metadata.csv with {len(metadata_map)} entries")
     return metadata_map
 
 # ═══════════════════════════════════════
 # HELPERS
+# (chunk_text / guess_category / guess_year now live in
+# indexing_helpers.py — imported above)
 # ═══════════════════════════════════════
-
-def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=OVERLAP):
-    words = text.split()
-    if not words:
-        return []
-    if len(words) <= chunk_size:
-        return [" ".join(words)]
-    step = max(chunk_size - overlap, chunk_size // 2)
-    chunks = []
-    for i in range(0, len(words), step):
-        chunk = " ".join(words[i:i + chunk_size])
-        if chunk.strip():
-            chunks.append(chunk)
-    return chunks
-
 
 def get_existing_chunk_ids() -> set:
     """Fallback dedup for any file not yet recorded in the documents table
@@ -202,39 +194,6 @@ def add_in_batches(chunks, ids, metadatas):
             ids=ids[start:end],
             metadatas=metadatas[start:end]
         )
-
-
-def guess_category(filename):
-    name = filename.lower()
-    if "inflation" in name:
-        return "inflation"
-    elif any(x in name for x in ["population", "demographic", "edhs", "projected_population"]):
-        return "population"
-    elif any(x in name for x in ["agriculture", "crop", "livestock", "agss", "farm"]):
-        return "agriculture"
-    elif "trade" in name:
-        return "trade"
-    elif "manufactur" in name:
-        return "manufacturing"
-    elif any(x in name for x in ["labour", "labor", "migration"]):
-        return "labour"
-    elif "housing" in name:
-        return "housing"
-    elif "survey" in name:
-        return "survey"
-    elif "land" in name:
-        return "land"
-    elif "commercial" in name:
-        return "commercial"
-    elif any(x in name for x in ["consumption", "welfare", "household"]):
-        return "household"
-    else:
-        return "general"
-
-
-def guess_year(filename):
-    match = re.search(r"(20\d{2})", filename)
-    return match.group(1) if match else "unknown"
 
 
 # ═══════════════════════════════════════

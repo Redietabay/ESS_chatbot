@@ -37,6 +37,12 @@
         </div>
 
         <div class="sidebar-footer">
+            {% if is_admin %}
+            <div style="display:flex; gap:10px; padding:0 4px 8px 4px; font-size:0.75rem;">
+                <a href="/admin/dashboard" style="color:#9fc7f7; text-decoration:none;">📊 Dashboard</a>
+                <a href="/admin/add_report" style="color:#9fc7f7; text-decoration:none;">➕ Add Report</a>
+            </div>
+            {% endif %}
             <div class="user-profile">
                 <div class="user-avatar">
                     {{ user[0].upper() if user else 'U' }}

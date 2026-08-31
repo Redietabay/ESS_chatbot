@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Add Report - ESS Chatbot</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <style>
+        .progress-wrap { display:none; margin-top:14px; }
+        .progress-track { background:#0f1a2e; border:1px solid #1e4d8c; border-radius:8px; height:10px; overflow:hidden; }
+        .progress-bar { height:100%; width:0%; background:#4fc3f7; transition:width 0.2s ease; }
+        .progress-bar.indeterminate {
+            width:40% !important;
+            animation: progress-slide 1.1s ease-in-out infinite;
+        }
+        @keyframes progress-slide {
+            0%   { margin-left: -40%; }
+            100% { margin-left: 100%; }
+        }
+        .progress-label { font-size:0.78rem; color:#9fc7f7; margin-top:6px; text-align:center; }
+        .dash-link { text-align:center; margin-top:10px; }
+        .dash-link a { color:#9fc7f7; font-size:0.8rem; text-decoration:none; }
+
+        /* Extra safety centering */
+        body.auth-page {
+            display: flex !important;
+            flex-direction: column !important;
+            align-items: center !important;
+            justify-content: center !important;
+            min-height: 100vh !important;
+            padding: 40px 16px !important;
+        }
+        .auth-container {
+            width: 100% !important;
+            max-width: 420px !important;
+            margin: 0 auto !important;
+        }
+    </style>
+</head>
+<body class="auth-page backend-bg">
+    <div class="auth-container">
+        <div class="auth-logo">
+            <img src="{{ url_for('static', filename='images/logo.png') }}" alt="ESS Logo" style="height: 70px; width: auto; margin-bottom: 12px; object-fit: contain;">
+            <h1>ESS Chatbot</h1>
+            <p>Add a report to the corpus</p>
+        </div>
+
+        <div class="auth-box">
+            <h2>Add Report</h2>
+
+            <div id="formError" class="auth-error" style="display:none;"></div>
+            <div id="formSuccess" class="auth-error" style="display:none; color:#8ff0cf; border-color:#10b981; background:rgba(16,185,129,0.12);"></div>
+
+            {% if error %}
+                <div class="auth-error">{{ error }}</div>
+            {% endif %}
+
+            <form id="addReportForm" action="/admin/add_report" method="POST" enctype="multipart/form-data">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+                <div class="form-group">
+                    <label>Report PDF</label>
+                    <input type="file" name="file" accept="application/pdf" required>
+                </div>
+
+                <div class="form-group">
+                    <label>Category (optional — auto-detected if left blank)</label>
+                    <select name="category" style="width:100%; padding:10px; border-radius:8px; background:#142845; color:#e8eef7; border:1px solid #1e4d8c;">
+                        <option value="">(auto-detect from filename)</option>
+                        <option value="inflation">Inflation</option>
+                        <option value="population">Population</option>
+                        <option value="agriculture">Agriculture</option>
+                        <option value="trade">Trade</option>
+                        <option value="manufacturing">Manufacturing</option>
+                        <option value="labour">Labour</option>
+                        <option value="housing">Housing</option>
+                        <option value="survey">Survey</option>
+                        <option value="land">Land</option>
+                        <option value="commercial">Commercial</option>
+                        <option value="household">Household</option>
+                        <option value="general">General</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>Year (optional — auto-detected from filename if blank)</label>
+                    <input type="text" name="year" placeholder="e.g. 2024">
+                </div>
+
+                <button type="submit" id="submitBtn" class="btn-send auth-btn">Add &amp; Index Report</button>
+
+                <div class="progress-wrap" id="progressWrap">
+                    <div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
+                    <div class="progress-label" id="progressLabel">Uploading…</div>
+                </div>
+            </form>
+
+            <p class="auth-footer-text" style="font-size:0.78rem; line-height:1.5;">
+                This adds the PDF straight into the live chatbot corpus —
+                no server access needed, and the report is answerable
+                immediately. Large or scanned PDFs may take a minute to
+                process (OCR runs page by page).
+            </p>
+
+            <div class="dash-link"><a href="/admin/dashboard">View observability dashboard →</a></div>
+        </div>
+    </div>
+
+    <script>
+        const form = document.getElementById('addReportForm');
+        const submitBtn = document.getElementById('submitBtn');
+        const progressWrap = document.getElementById('progressWrap');
+        const progressBar = document.getElementById('progressBar');
+        const progressLabel = document.getElementById('progressLabel');
+        const errorBox = document.getElementById('formError');
+        const successBox = document.getElementById('formSuccess');
+
+        form.addEventListener('submit', function (e) {
+            e.preventDefault();
+            errorBox.style.display = 'none';
+            successBox.style.display = 'none';
+            submitBtn.disabled = true;
+            progressWrap.style.display = 'block';
+            progressBar.classList.remove('indeterminate');
+            progressBar.style.width = '0%';
+            progressLabel.textContent = 'Uploading…';
+
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', form.action, true);
+
+            xhr.upload.addEventListener('progress', function (evt) {
+                if (evt.lengthComputable) {
+                    const pct = Math.round((evt.loaded / evt.total) * 100);
+                    progressBar.style.width = pct + '%';
+                    if (pct >= 100) {
+                        progressLabel.textContent = 'Processing & indexing… (OCR can take a minute on scanned pages)';
+                        progressBar.classList.add('indeterminate');
+                    }
+                }
+            });
+
+            xhr.onload = function () {
+                submitBtn.disabled = false;
+                progressWrap.style.display = 'none';
+                let data = {};
+                try { data = JSON.parse(xhr.responseText); } catch (err) {}
+
+                if (xhr.status >= 200 && xhr.status < 300 && data.success) {
+                    successBox.textContent = data.message || 'Report added.';
+                    successBox.style.display = 'block';
+                    form.reset();
+                } else {
+                    errorBox.textContent = data.error || 'Something went wrong — check server logs.';
+                    errorBox.style.display = 'block';
+                }
+            };
+
+            xhr.onerror = function () {
+                submitBtn.disabled = false;
+                progressWrap.style.display = 'none';
+                errorBox.textContent = 'Network error — please try again.';
+                errorBox.style.display = 'block';
+            };
+
+            xhr.send(new FormData(form));
+        });
+    </script>
+</body>
+</html>

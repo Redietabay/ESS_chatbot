@@ -2,7 +2,7 @@ import psycopg2
 from dotenv import load_dotenv
 import os
 
-# .env ፋይልን ለማንበብ
+# .env read file
 load_dotenv() 
 
 def create_database_tables():

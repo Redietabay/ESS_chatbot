@@ -26,6 +26,14 @@ from rag import get_answer, get_answer_stream, ensure_cache_table, CSV_DATA, db_
 from pdf_extract import extract_document
 from tts_route import tts_bp
 
+# Reused by /admin/add_report below — this is the SAME ChromaDB collection
+# (and lock) rag.py's retriever already created for answering questions.
+# Deliberately imported as a module (not "from retriever import collection")
+# so we always see the live object, never a stale copy.
+import retriever
+from report_indexer import index_single_pdf
+from indexing_helpers import append_metadata_csv
+
 STREAM_META_SEP = "\x00__ESS_META__\x00"
 MAX_QUESTION_LENGTH = 1000  # chars — generous for real questions, blocks megabyte-scale abuse
 GUEST_QUESTION_LIMIT = int(os.getenv("GUEST_QUESTION_LIMIT", "0"))  # per-browser-session cap for guests; 0 (default) = unlimited
@@ -34,6 +42,16 @@ GUEST_QUESTION_LIMIT = int(os.getenv("GUEST_QUESTION_LIMIT", "0"))  # per-browse
 UPLOAD_MAX_BYTES = 15 * 1024 * 1024   # 15 MB
 UPLOAD_MAX_PAGES = 60                 # pages read from the PDF before truncating
 UPLOAD_ALLOWED_EXTENSIONS = {".pdf"}
+
+# ── "Add report" admin config ──
+# Previously gated by a single shared secret (ADMIN_REPORT_TOKEN). Replaced
+# with real per-user admin roles: a `users.is_admin` column + normal login.
+# ADMIN_USERNAMES (comma-separated) is applied once at startup to promote
+# specific accounts — set it in .env, e.g. ADMIN_USERNAMES=roba,data_team.
+# To promote someone later without touching .env, run directly against the
+# DB: UPDATE users SET is_admin = TRUE WHERE username = 'someone';
+ADMIN_USERNAMES = [u.strip() for u in os.getenv("ADMIN_USERNAMES", "").split(",") if u.strip()]
+REPORT_PDF_FOLDER = os.getenv("REPORT_PDF_FOLDER", "data/pdf")
 # Caps the whole request body Werkzeug will buffer, not just this route —
 # without it, a huge POST is read into memory in full before our own
 # UPLOAD_MAX_BYTES check in upload_document() ever runs.
@@ -169,6 +187,66 @@ def init_db():
             # (called below) — single source of truth, avoids schema drift
             # between the two definitions.
 
+            # 4. File-level indexing completion tracker — referenced by
+            # index_pdfs.py, /admin/add_report, and the dashboard below.
+            # Created here defensively in case it only ever existed via a
+            # manual migration on the live DB.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS documents (
+                    filename     VARCHAR(255) PRIMARY KEY,
+                    chunk_count  INTEGER,
+                    ocr_pages    INTEGER DEFAULT 0,
+                    indexed_at   TIMESTAMP DEFAULT NOW()
+                )
+            """)
+
+            # 5. Real admin role — replaces the old shared ADMIN_REPORT_TOKEN.
+            cur.execute("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE
+            """)
+
+            # 6. Audit log for every /admin/add_report attempt (who, what,
+            # whether it worked) — replaces having to grep app_log.txt to
+            # find out who added a given report, and doubles as the
+            # "failed index jobs" feed for the observability dashboard.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS admin_report_log (
+                    id            SERIAL PRIMARY KEY,
+                    user_id       INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    username      VARCHAR(80),
+                    filename      VARCHAR(255),
+                    category      VARCHAR(50),
+                    year          VARCHAR(10),
+                    chunks_added  INTEGER,
+                    tables_found  INTEGER,
+                    pages_ocrd    INTEGER,
+                    success       BOOLEAN NOT NULL,
+                    error_message TEXT,
+                    created_at    TIMESTAMP DEFAULT NOW()
+                )
+            """)
+
+            # 7. Per-question request log — powers the observability
+            # dashboard (cache hit rate, average latency by route, recent
+            # errors). Deliberately separate from chat_history: that table
+            # only stores turns for logged-in users with a saved session,
+            # so it undercounts guest traffic entirely.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS request_log (
+                    id          SERIAL PRIMARY KEY,
+                    route       VARCHAR(20),
+                    cached      BOOLEAN NOT NULL DEFAULT FALSE,
+                    elapsed_ms  INTEGER,
+                    language    VARCHAR(5),
+                    error       BOOLEAN NOT NULL DEFAULT FALSE,
+                    is_guest    BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at  TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_request_log_created ON request_log(created_at)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_report_log_created ON admin_report_log(created_at)")
+
             # Indexes for performance
             cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_history_session ON chat_history(session_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_sessions_user ON chat_sessions(user_id)")
@@ -182,6 +260,32 @@ def init_db():
 init_db()
 ensure_cache_table()
 
+def _promote_configured_admins():
+    """Applies ADMIN_USERNAMES on every startup — idempotent (just sets
+    is_admin=TRUE again for names already promoted), and picks up a name
+    added to .env without needing a manual SQL UPDATE."""
+    if not ADMIN_USERNAMES:
+        return
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute(
+                "UPDATE users SET is_admin = TRUE WHERE username = ANY(%s) RETURNING username",
+                (ADMIN_USERNAMES,)
+            )
+            promoted = [r[0] for r in cur.fetchall()]
+        if promoted:
+            log.info(f"Admin role confirmed for: {', '.join(promoted)}")
+        missing = set(ADMIN_USERNAMES) - set(promoted)
+        if missing:
+            log.warning(
+                f"ADMIN_USERNAMES lists account(s) that don't exist yet (they'll "
+                f"become admin automatically once registered): {', '.join(missing)}"
+            )
+    except Exception:
+        log.exception("Could not apply ADMIN_USERNAMES")
+
+_promote_configured_admins()
+
 # ═══════════════════════════════════════
 # AUTH HELPERS
 # ═══════════════════════════════════════
@@ -193,6 +297,24 @@ def login_required(f):
     def decorated(*args, **kwargs):
         if "user_id" not in session:
             return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return decorated
+
+def admin_required(f):
+    """Replaces the old shared-token check on /admin/add_report. Requires a
+    real logged-in session AND users.is_admin — no separate secret to leak
+    or rotate. Not-logged-in -> straight to /login (same as login_required).
+    Logged in but not an admin -> a 403 with a clear message instead of a
+    silent redirect, so it's obvious why they're blocked."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if "user_id" not in session:
+            return redirect(url_for("login"))
+        if not session.get("is_admin"):
+            return render_template(
+                "admin_add_report.html",
+                error="Your account doesn't have admin access. Ask an existing admin to grant it."
+            ), 403
         return f(*args, **kwargs)
     return decorated
 
@@ -226,6 +348,23 @@ def guest_questions_remaining():
 
 def register_guest_question():
     session["guest_qcount"] = guest_questions_used() + 1
+
+def log_request_async(route: str, cached: bool, elapsed_ms: int, language: str, error: bool, is_guest: bool):
+    """Fire-and-forget insert into request_log, powering the admin
+    dashboard's cache-hit-rate / latency / error-rate panels. Runs in a
+    background thread so a slow DB write never adds latency to the answer
+    the user is waiting on — same pattern as rag.py's token-budget persist."""
+    def _write():
+        try:
+            with db_cursor(commit=True) as cur:
+                cur.execute(
+                    """INSERT INTO request_log (route, cached, elapsed_ms, language, error, is_guest)
+                       VALUES (%s,%s,%s,%s,%s,%s)""",
+                    (route, cached, elapsed_ms, language, error, is_guest)
+                )
+        except Exception:
+            log.exception("Failed to write request_log entry")
+    threading.Thread(target=_write, daemon=True).start()
 
 GUEST_HISTORY_TURNS = 3       # kept small — server-memory footprint, not DB
 GUEST_HISTORY_TTL_SECONDS = 2 * 3600
@@ -424,16 +563,18 @@ def register():
                 )
 
             password_hash = generate_password_hash(password)
+            is_admin = username in ADMIN_USERNAMES
             cur.execute(
-                """INSERT INTO users (username, email, password_hash)
-                   VALUES (%s, %s, %s) RETURNING id""",
-                (username, email, password_hash)
+                """INSERT INTO users (username, email, password_hash, is_admin)
+                   VALUES (%s, %s, %s, %s) RETURNING id""",
+                (username, email, password_hash, is_admin)
             )
             user_id = cur.fetchone()[0]
 
         session["user_id"]  = user_id
         session["username"] = username
-        log.info(f"New user registered: {username}")
+        session["is_admin"] = is_admin
+        log.info(f"New user registered: {username}" + (" (admin)" if is_admin else ""))
         return redirect(url_for("chat"))
 
     except Exception:
@@ -455,7 +596,7 @@ def login():
     try:
         with db_cursor() as cur:
             cur.execute(
-                "SELECT id, username, password_hash FROM users WHERE username=%s",
+                "SELECT id, username, password_hash, is_admin FROM users WHERE username=%s",
                 (username,)
             )
             user = cur.fetchone()
@@ -465,6 +606,7 @@ def login():
 
         session["user_id"]  = user[0]
         session["username"] = user[1]
+        session["is_admin"] = bool(user[3])
         log.info(f"User logged in: {username}")
         return redirect(url_for("chat"))
 
@@ -500,7 +642,7 @@ def api_login():
     try:
         with db_cursor() as cur:
             cur.execute(
-                "SELECT id, username, password_hash FROM users WHERE username=%s",
+                "SELECT id, username, password_hash, is_admin FROM users WHERE username=%s",
                 (username,)
             )
             user = cur.fetchone()
@@ -510,6 +652,7 @@ def api_login():
 
         session["user_id"]  = user[0]
         session["username"] = user[1]
+        session["is_admin"] = bool(user[3])
         log.info(f"User logged in via widget: {username}")
         return jsonify({"success": True, "username": user[1]})
 
@@ -545,15 +688,17 @@ def api_register():
                 return jsonify({"error": "Username or email already exists."}), 409
 
             password_hash = generate_password_hash(password)
+            is_admin = username in ADMIN_USERNAMES
             cur.execute(
-                """INSERT INTO users (username, email, password_hash)
-                   VALUES (%s, %s, %s) RETURNING id""",
-                (username, email, password_hash)
+                """INSERT INTO users (username, email, password_hash, is_admin)
+                   VALUES (%s, %s, %s, %s) RETURNING id""",
+                (username, email, password_hash, is_admin)
             )
             user_id = cur.fetchone()[0]
 
         session["user_id"]  = user_id
         session["username"] = username
+        session["is_admin"] = is_admin
         log.info(f"New user registered via widget: {username}")
         return jsonify({"success": True, "username": username})
 
@@ -617,7 +762,7 @@ def chat():
 
     if user_id is None:
         # Guest — no account, so no saved sessions to show.
-        return render_template("chat.html", user=None, sessions=[], is_guest=True)
+        return render_template("chat.html", user=None, sessions=[], is_guest=True, is_admin=False)
 
     try:
         with db_cursor() as cur:
@@ -636,11 +781,11 @@ def chat():
             "updated_at": r[2]
         } for r in rows]
         
-        return render_template("chat.html", user=username, sessions=sessions_list, is_guest=False)
+        return render_template("chat.html", user=username, sessions=sessions_list, is_guest=False, is_admin=session.get("is_admin", False))
 
     except Exception:
         log.exception("Chat page error")
-        return render_template("chat.html", user=username, sessions=[], is_guest=False)
+        return render_template("chat.html", user=username, sessions=[], is_guest=False, is_admin=session.get("is_admin", False))
 
 @app.route("/new_session", methods=["POST"])
 @login_required
@@ -752,6 +897,8 @@ def ask():
         ) or {}
     except Exception:
         log.exception("RAG pipeline error")
+        log_request_async("ask", cached=False, elapsed_ms=int((time.time() - _t0) * 1000),
+                           language=force_lang or "en", error=True, is_guest=user_id is None)
         return jsonify({"error": "Failed to get answer. Please try again."}), 500
 
     if user_id is None:
@@ -762,6 +909,9 @@ def ask():
     page   = result.get("page", 0)
     route  = result.get("route", "unknown")
     cached = result.get("cached", False)
+
+    log_request_async(route, cached=cached, elapsed_ms=int((time.time() - _t0) * 1000),
+                       language=force_lang or "en", error=False, is_guest=user_id is None)
 
     if user_id is None:
         append_guest_history(question, answer)
@@ -869,11 +1019,17 @@ def ask_stream():
                 full_answer = fallback
                 yield fallback
             meta = {"source": "Unknown", "page": 0, "route": "error"}
+            log_request_async("ask_stream", cached=False, elapsed_ms=int((time.time() - _t0) * 1000),
+                               language=force_lang or "en", error=True, is_guest=user_id is None)
 
         answer = meta.get("answer") or full_answer
         source = meta.get("source", "Unknown")
         page   = meta.get("page", 0)
         route  = meta.get("route", "unknown")
+
+        if route != "error":
+            log_request_async(route, cached=(route == "cache"), elapsed_ms=int((time.time() - _t0) * 1000),
+                               language=force_lang or "en", error=False, is_guest=user_id is None)
 
         if user_id is None:
             append_guest_history(question, answer)
@@ -957,6 +1113,225 @@ def delete_session(session_id):
     except Exception:
         log.exception("Delete session error")
         return jsonify({"success": False}), 500
+
+@app.route("/admin/add_report", methods=["GET", "POST"])
+@admin_required
+@limiter.limit("10 per hour")
+def admin_add_report():
+    """Adds a PDF straight into the permanent ESS corpus from the browser —
+    replaces "copy the file onto the server and run `python index_pdfs.py`
+    by hand". Runs the exact same extraction/chunking pipeline as that
+    script (via report_indexer.py) and writes into the SAME live ChromaDB
+    collection the chatbot already answers from, so the report is
+    answerable immediately — no restart, no separate reindex step.
+
+    Gated by @admin_required (real per-user role, see users.is_admin) —
+    replaces the old shared ADMIN_REPORT_TOKEN. POST responds with JSON so
+    the page's own JS can show real upload progress + an indexing spinner
+    instead of a blocking full-page reload."""
+    if request.method == "GET":
+        return render_template("admin_add_report.html")
+
+    def _log_attempt(filename, category, year, result, success, error_message=None):
+        try:
+            with db_cursor(commit=True) as cur:
+                cur.execute(
+                    """INSERT INTO admin_report_log
+                       (user_id, username, filename, category, year, chunks_added,
+                        tables_found, pages_ocrd, success, error_message)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (
+                        current_user_id(), current_username(), filename, category, year,
+                        (result or {}).get("chunks_added"), (result or {}).get("tables_found"),
+                        (result or {}).get("pages_ocrd"), success, error_message,
+                    ),
+                )
+        except Exception:
+            log.exception("Failed to write admin_report_log entry")
+
+    f = request.files.get("file")
+    if f is None or f.filename == "":
+        return jsonify({"error": "No file selected."}), 400
+
+    filename = os.path.basename(f.filename)
+    if not filename.lower().endswith(".pdf"):
+        return jsonify({"error": "Only PDF files are supported."}), 400
+
+    category = (request.form.get("category") or "").strip() or None
+    year = (request.form.get("year") or "").strip() or None
+
+    file_bytes = f.read(UPLOAD_MAX_BYTES + 1)
+    if len(file_bytes) > UPLOAD_MAX_BYTES:
+        return jsonify({"error": f"File too large — max {UPLOAD_MAX_BYTES // (1024 * 1024)} MB."}), 400
+    if not file_bytes:
+        return jsonify({"error": "Uploaded file is empty."}), 400
+
+    try:
+        os.makedirs(REPORT_PDF_FOLDER, exist_ok=True)
+        dest_path = os.path.join(REPORT_PDF_FOLDER, filename)
+        with open(dest_path, "wb") as out:
+            out.write(file_bytes)
+
+        result = index_single_pdf(
+            file_bytes, filename,
+            collection=retriever.collection,
+            collection_lock=retriever._collection_lock,
+            category=category, year=year,
+        )
+
+        with db_cursor(commit=True) as cur:
+            cur.execute(
+                """
+                INSERT INTO documents (filename, chunk_count, indexed_at, ocr_pages)
+                VALUES (%s, %s, NOW(), %s)
+                ON CONFLICT (filename) DO UPDATE
+                    SET chunk_count = EXCLUDED.chunk_count,
+                        indexed_at  = NOW(),
+                        ocr_pages   = EXCLUDED.ocr_pages;
+                """,
+                (filename, result["chunks_added"], result["pages_ocrd"]),
+            )
+
+        append_metadata_csv(REPORT_PDF_FOLDER, filename, result["category"], result["year"])
+        _log_attempt(filename, result["category"], result["year"], result, success=True)
+
+        log.info(
+            f"Admin '{current_username()}' added report '{filename}' — {result['chunks_added']} chunks "
+            f"({result['tables_found']} tables, {result['pages_ocrd']} OCR'd pages), "
+            f"category={result['category']}, year={result['year']}"
+        )
+
+        warning = (
+            " No text or tables could be extracted from this PDF (even with OCR) — "
+            "it won't be answerable until that's fixed."
+        ) if result["chunks_added"] == 0 else ""
+
+        return jsonify({
+            "success": True,
+            "message": (
+                f"'{filename}' added — {result['chunks_added']} chunks indexed "
+                f"({result['tables_found']} tables, {result['pages_ocrd']} of "
+                f"{result['pages_total']} pages needed OCR), category="
+                f"{result['category']}, year={result['year']}. "
+                f"Answerable immediately — no restart needed.{warning}"
+            ),
+        })
+
+    except Exception as e:
+        log.exception(f"Admin add_report failed for '{filename}'")
+        _log_attempt(filename, category, year, None, success=False, error_message=str(e)[:500])
+        return jsonify({"error": "Something went wrong indexing that PDF — check server logs."}), 500
+
+
+def _gather_dashboard_stats():
+    """Shared stats-gathering used by BOTH the server-rendered dashboard
+    page (first paint) and the /admin/dashboard/data JSON endpoint (used
+    by the page's own auto-refresh polling). Keeping this in one function
+    means the two can never drift apart on what a number means."""
+    stats = {}
+    try:
+        with db_cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') AS total_24h,
+                    COUNT(*) FILTER (WHERE cached AND created_at > NOW() - INTERVAL '24 hours') AS cached_24h,
+                    COUNT(*) FILTER (WHERE error AND created_at > NOW() - INTERVAL '24 hours') AS errors_24h,
+                    AVG(elapsed_ms) FILTER (WHERE NOT cached AND created_at > NOW() - INTERVAL '24 hours') AS avg_latency_ms
+                FROM request_log
+            """)
+            row = cur.fetchone() or (0, 0, 0, None)
+            total_24h, cached_24h, errors_24h, avg_latency_ms = row
+            stats["total_24h"] = total_24h or 0
+            stats["cache_hit_rate"] = round(100 * (cached_24h or 0) / total_24h, 1) if total_24h else 0.0
+            stats["errors_24h"] = errors_24h or 0
+            stats["avg_latency_ms"] = round(avg_latency_ms) if avg_latency_ms else None
+
+            # Hourly buckets for the last 24h — powers the traffic-over-time
+            # chart on the dashboard. Zero-filled so the chart always has 24
+            # points even on hours with no traffic at all.
+            cur.execute("""
+                SELECT date_trunc('hour', created_at) AS hr, COUNT(*)
+                FROM request_log
+                WHERE created_at > NOW() - INTERVAL '24 hours'
+                GROUP BY hr ORDER BY hr
+            """)
+            hourly_map = {r[0].strftime("%H:00"): r[1] for r in cur.fetchall()}
+            stats["hourly_labels"] = list(hourly_map.keys())
+            stats["hourly_counts"] = list(hourly_map.values())
+
+            cur.execute("""
+                SELECT route, COUNT(*), AVG(elapsed_ms) FILTER (WHERE NOT cached)
+                FROM request_log
+                WHERE created_at > NOW() - INTERVAL '24 hours'
+                GROUP BY route ORDER BY COUNT(*) DESC
+            """)
+            stats["by_route"] = [
+                {"route": r[0] or "unknown", "count": r[1], "avg_latency_ms": round(r[2]) if r[2] else None}
+                for r in cur.fetchall()
+            ]
+
+            cur.execute("""
+                SELECT filename, username, category, year, chunks_added, success, error_message, created_at
+                FROM admin_report_log ORDER BY created_at DESC LIMIT 15
+            """)
+            stats["recent_reports"] = [
+                {"filename": r[0], "username": r[1] or "unknown", "category": r[2], "year": r[3],
+                 "chunks_added": r[4], "success": r[5], "error_message": r[6],
+                 "created_at": r[7].strftime("%b %d, %H:%M") if r[7] else ""}
+                for r in cur.fetchall()
+            ]
+
+            cur.execute("SELECT COUNT(*), COALESCE(SUM(ocr_pages), 0) FROM documents")
+            doc_count, ocr_pages_total = cur.fetchone()
+            stats["documents_indexed"] = doc_count or 0
+            stats["ocr_pages_total"] = ocr_pages_total or 0
+
+    except Exception:
+        log.exception("Dashboard query failed")
+        stats.setdefault("total_24h", 0)
+        stats.setdefault("cache_hit_rate", 0.0)
+        stats.setdefault("errors_24h", 0)
+        stats.setdefault("avg_latency_ms", None)
+        stats.setdefault("hourly_labels", [])
+        stats.setdefault("hourly_counts", [])
+        stats.setdefault("by_route", [])
+        stats.setdefault("recent_reports", [])
+        stats.setdefault("documents_indexed", 0)
+        stats.setdefault("ocr_pages_total", 0)
+
+    try:
+        stats["corpus_by_category"] = retriever.get_corpus_summary()
+    except Exception:
+        log.exception("Corpus summary failed")
+        stats["corpus_by_category"] = {}
+
+    stats["groq_budget"] = get_budget_status()
+    return stats
+
+
+@app.route("/admin/dashboard")
+@admin_required
+def admin_dashboard():
+    """Lightweight observability page: cache hit rate, average latency by
+    route, recent errors, indexed corpus breakdown, and the report-add
+    audit trail (including failures) — everything that previously required
+    grepping app_log.txt / rag_log.txt / retriever_log.txt by hand.
+
+    First paint is server-rendered (works even with JS disabled); the page
+    then polls /admin/dashboard/data on its own to stay live without a
+    full reload."""
+    stats = _gather_dashboard_stats()
+    return render_template("admin_dashboard.html", stats=stats)
+
+
+@app.route("/admin/dashboard/data")
+@admin_required
+def admin_dashboard_data():
+    """JSON version of the same stats, polled every few seconds by
+    admin_dashboard.html's own JS so the numbers/charts/log update live
+    without the admin having to refresh the page."""
+    return jsonify(_gather_dashboard_stats())
+
 
 @app.route("/upload_document", methods=["POST"])
 @optional_login
