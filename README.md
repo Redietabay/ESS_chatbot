@@ -18,13 +18,13 @@ website.
 ## Screenshots
 
 **Chat dashboard** — sidebar history, bilingual toggle, mic input, sourced answers
-![Chat dashboard](docs/screenshots/chat-dashboard.png)
+![Chat dashboard](screenshots/chat-dashboard.png)
 
 **Embeddable widget** — same AI core, drops into any page as a floating bubble
-![Widget](docs/screenshots/widget-test-page.png)
+![Widget](screenshots/widget-test-page.png)
 
 **Admin observability dashboard** — live traffic, latency, OCR, and corpus stats
-![Observability dashboard](docs/screenshots/observability-dashboard.png)
+![Observability dashboard](screenshots/observability-dashboard.png)
 
 ---
 
