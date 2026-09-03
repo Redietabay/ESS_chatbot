@@ -140,13 +140,13 @@ Create a `.env` file in the project root:
 DB_HOST=localhost
 DB_PORT=5432
 DB_NAME=ess_chatbot_db
-DB_USER=postgres
+DB_USER=
 
-DB_PASSWORD=Reduesschatbot
-SECRET_KEY=b51fb926f07e8ad3170437c5f0a2db0b1016f6c345a5a69411c01c5d9080bcd6
+DB_PASSWORD=
+SECRET_KEY=
 # ── LLM Fallback Chain: Groq -> Gemini -> Mistral -> OpenRouter -> Cerebras(off) -> Ollama(off) ──
 # 1) GROQ (primary — fastest, tried first)
-GROQ_API_KEY=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
+GROQ_API_KEY=
 GROQ_MODEL=openai/gpt-oss-120b
 GROQ_FAST_MODEL=openai/gpt-oss-20b
 GROQ_DAILY_TOKEN_LIMIT=100000
@@ -154,18 +154,18 @@ GROQ_RATE_LIMIT_MAX_WAIT=1.0
 GROQ_REQUEST_TIMEOUT=30.0
 
 # 2) GEMINI (1st fallback — most reliable in your logs; occasional DNS/503
-GEMINI_API_KEY=AQ.Ab8RN6JMWrL-h_aKcMb_Vh7nYTc8rQ5ENOgAcb_kEfMUQ2d94w 
+GEMINI_API_KEY=
 GEMINI_MODEL=gemini-flash-latest
 # 3) MISTRAL (2nd fallback — new tier added this session; genuinely free,
-MISTRAL_API_KEY=N0HiPGrQkgNtVOF9u7kVidBHPKZ6hU2E
+MISTRAL_API_KEY=
 MISTRAL_MODEL=mistral-small-latest
 # 4) OPENROUTER (3rd fallback — "openrouter/free" is OpenRouter's own
-OPENROUTER_API_KEY=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
+OPENROUTER_API_KEY=
 OPENROUTER_MODEL=openrouter/free
 # 5) CEREBRAS (last cloud fallback — DISABLED: your logs show
 
 CEREBRAS_ENABLED=false
-CEREBRAS_API_KEY=csk-wnkcje9tjtryrvkfexvkrmw43v2vmtr2d3pxt9992yevty98
+CEREBRAS_API_KEY=
 CEREBRAS_MODEL=gpt-oss-120b
 
 # Fallback order — matches what's actually reliable per your logs, not
